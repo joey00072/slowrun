@@ -348,13 +348,23 @@ class GPT(nn.Module):
 
     def get_device(self):
         return self.transformer.wte.weight.device
+        
+    def _avg_causal_attended_keys(self, window, seq_len):
+        if window < 0 or window >= seq_len - 1:
+            return (seq_len + 1) / 2
+        max_keys = min(window + 1, seq_len)
+        return max_keys - max_keys * (max_keys - 1) / (2 * seq_len)
 
     def estimate_flops(self):
         nparams = sum(p.numel() for p in self.parameters())
-        ve_numel = sum(p.weight.numel() for p in self.ve_projs.values())
-        nparams_exclude = self.transformer.wte.weight.numel() + ve_numel + self.resid_lambdas.numel() + self.x0_lambdas.numel()
+        # Exclude non-matmul params: embedding lookup + elementwise scalars
+        nparams_exclude = (self.transformer.wte.weight.numel()
+                          + self.resid_lambdas.numel()
+                          + self.x0_lambdas.numel()
+                          + self.skip_weights.numel())
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
-        attn_flops = sum(12 * h * q * min(w[0], t) if w[0] >= 0 else 12 * h * q * t for w in self.window_sizes)
+        # Exact causal sliding-window attention FLOPs: 12 * h * q * E[keys attended per query]
+        attn_flops = sum(12 * h * q * self._avg_causal_attended_keys(w[0], t) for w in self.window_sizes)
         return 6 * (nparams - nparams_exclude) + attn_flops
 
     def setup_optimizer(self):
