@@ -61,10 +61,6 @@ parser.add_argument("--dupe-loops", type=int, default=2,
                     help="Number of extra replay passes through dupe layers")
 parser.add_argument("--warmdown-ratio", type=float, default=None,
                     help="Override warmdown ratio (default 0.4)")
-parser.add_argument("--ema-decays", type=str, default="",
-                    help="Comma-separated EMA decay rates, e.g. '0.999,0.9995,0.9998'")
-parser.add_argument("--ema-start-frac", type=float, default=0.90,
-                    help="Fraction of training after which to start EMA tracking")
 parser.add_argument("--logit-cap", type=float, default=10.0,
                     help="Logit soft-capping value (0=disabled)")
 parser.add_argument("--logit-avg", type=int, default=3,
@@ -136,32 +132,6 @@ class DummyWandb:
     def finish(self): pass
 
 # =============================================================================
-# EMA (Exponential Moving Average) for weight averaging
-# =============================================================================
-
-class EMATracker:
-    """Maintains EMA shadow weights on CPU for memory efficiency."""
-    def __init__(self, model, decay):
-        self.decay = decay
-        self.shadow = {name: p.data.float().cpu().clone() for name, p in model.named_parameters()}
-        self.num_updates = 0
-
-    @torch.no_grad()
-    def update(self, model):
-        self.num_updates += 1
-        d = self.decay
-        for name, p in model.named_parameters():
-            self.shadow[name].lerp_(p.data.float().cpu(), 1 - d)
-
-    def apply_to(self, model):
-        """Copy EMA weights into model (for evaluation)."""
-        for name, p in model.named_parameters():
-            p.data.copy_(self.shadow[name].to(p.device, dtype=p.dtype))
-
-    def state_dict(self):
-        return dict(self.shadow)
-
-
 def load_state_dict_into_model(model, state_dict):
     """Load a state dict into model, handling dtype conversion."""
     for name, p in model.named_parameters():
@@ -735,7 +705,7 @@ def evaluate_bpb_logit_avg(eval_model, ckpt_paths, weights, steps):
 
     Loads each checkpoint from disk once, runs all val batches for it, then
     moves to the next — one CPU->GPU weight transfer per checkpoint, not per batch.
-    Accumulates only per-token target probabilities on CPU (~5 MB).
+    Accumulates running scalar totals instead of per-token tensors.
     """
     dev = orig_model.get_device()
     V   = orig_model.config.vocab_size
@@ -748,11 +718,13 @@ def evaluate_bpb_logit_avg(eval_model, ckpt_paths, weights, steps):
         all_x.append(x.cpu())
         all_y.append(y.cpu())
 
-    BT         = all_y[0].numel()
-    all_y_flat = torch.cat([y.view(-1) for y in all_y])   # (steps*BT,) CPU
+    BT = all_y[0].numel()
+
+    # Per-batch accumulated weighted target probs, kept on GPU
+    # Shape: (steps, BT) — only target-token probs, not full vocab
+    batch_target_probs = torch.zeros(steps, BT, dtype=torch.float32, device=dev)
 
     # Checkpoint-outer, batch-inner: each checkpoint loaded exactly once
-    all_target_probs = torch.zeros(steps * BT, dtype=torch.float32)
     for path, w in zip(ckpt_paths, weights):
         ckpt = torch.load(path, map_location="cpu", weights_only=True)
         load_state_dict_into_model(orig_model, ckpt)
@@ -763,17 +735,26 @@ def evaluate_bpb_logit_avg(eval_model, ckpt_paths, weights, steps):
                 logits = eval_model(x.to(dev))
             probs = torch.softmax(logits.view(BT, V).float(), dim=-1)
             tgt   = probs[torch.arange(BT, device=dev), y_flat.clamp_min(0)]
-            all_target_probs[i*BT:(i+1)*BT].add_(tgt.cpu(), alpha=w)
+            batch_target_probs[i].add_(tgt, alpha=w)
 
-    # Compute metrics from accumulated per-token target probs
-    mask          = all_y_flat != -1
-    log_probs     = all_target_probs.clamp_min(1e-40).log()
-    num_bytes_cpu = token_bytes.cpu()[all_y_flat.clamp_min(0)]
+    # Compute metrics from accumulated target probs using running totals
+    total_nats   = torch.tensor(0.0, dtype=torch.float64, device=dev)
+    total_bytes  = torch.tensor(0, dtype=torch.int64, device=dev)
+    total_loss   = torch.tensor(0.0, dtype=torch.float64, device=dev)
+    total_tokens = torch.tensor(0, dtype=torch.int64, device=dev)
 
-    total_nats   = torch.tensor((log_probs.neg() * (num_bytes_cpu > 0)).sum().item(), dtype=torch.float32, device=dev)
-    total_bytes  = torch.tensor(num_bytes_cpu.sum().item(),                           dtype=torch.int64,   device=dev)
-    total_loss   = torch.tensor(log_probs[mask].neg().sum().item(),                   dtype=torch.float32, device=dev)
-    total_tokens = torch.tensor(mask.sum().item(),                                    dtype=torch.int64,   device=dev)
+    for i, y in enumerate(all_y):
+        y_flat = y.view(-1).to(dev)
+        mask = y_flat != -1
+        log_probs = batch_target_probs[i].clamp_min(1e-40).log()
+        num_bytes_batch = token_bytes[y_flat.clamp_min(0)]
+
+        total_nats   += (log_probs.neg() * (num_bytes_batch > 0)).sum().double()
+        total_bytes  += num_bytes_batch.sum()
+        total_loss   += log_probs[mask].neg().sum().double()
+        total_tokens += mask.sum()
+
+    del batch_target_probs
 
     if dist.is_initialized():
         dist.all_reduce(total_nats,   op=dist.ReduceOp.SUM)
@@ -922,17 +903,10 @@ timing_start_step = 4  # skip first compile + 3 warmup steps
 eval_steps = EVAL_TOKENS // (args.device_batch_size * MAX_SEQ_LEN * ddp_world_size)
 dupe_active = False
 
-# EMA and checkpoint averaging setup
-ema_decays = [float(d) for d in args.ema_decays.split(",") if d.strip()] if args.ema_decays else []
-ema_start_step = round(args.ema_start_frac * num_iterations)
-ema_trackers = []  # initialized lazily at ema_start_step
-ema_initialized = False
 late_checkpoint_paths = []  # paths to saved epoch checkpoints for logit averaging
 logit_avg_count = args.logit_avg
 if logit_avg_count > 0 and master_process:
     os.makedirs(args.logit_avg_dir, exist_ok=True)
-if ema_decays:
-    print0(f"EMA decays: {ema_decays}, starting at step {ema_start_step} ({args.ema_start_frac*100:.0f}% of training)")
 if logit_avg_count > 0:
     print0(f"Logit averaging: saving last {logit_avg_count} epoch checkpoints to {args.logit_avg_dir}/")
 
@@ -983,15 +957,6 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
     dt = time.time() - t0
 
     step += 1
-
-    # EMA update (every 10 steps to minimize CPU copy overhead)
-    if ema_decays and step >= ema_start_step and step % 10 == 0:
-        if not ema_initialized:
-            print0(f"Initializing {len(ema_decays)} EMA tracker(s) at step {step}")
-            ema_trackers = [EMATracker(orig_model, d) for d in ema_decays]
-            ema_initialized = True
-        for ema in ema_trackers:
-            ema.update(orig_model)
 
     # Logging
     ema_beta = 0.9
@@ -1058,32 +1023,8 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
         gc.collect(); gc.freeze(); gc.disable()
 
 # =============================================================================
-# Post-training: evaluate EMA and checkpoint averages
+# Post-training: evaluate checkpoint averages
 # =============================================================================
-
-# Save the original (final) model weights so we can restore after EMA eval
-final_weights = None
-if ema_trackers:
-    final_weights = {name: p.data.clone() for name, p in orig_model.named_parameters()}
-
-# Evaluate EMA blend (single best ratio for speed)
-for i, ema in enumerate(ema_trackers):
-    print0(f"\n--- Evaluating EMA blend (decay={ema.decay}, {ema.num_updates} updates) ---")
-    alpha = 0.7  # best from sweep: 0.7*final + 0.3*EMA
-    for name, p in orig_model.named_parameters():
-        blended = alpha * final_weights[name] + (1 - alpha) * ema.shadow[name].to(final_weights[name].device, dtype=final_weights[name].dtype)
-        p.data.copy_(blended.to(p.device, dtype=p.dtype))
-    blend_model = torch.compile(orig_model, dynamic=False)
-    blend_model.eval()
-    val_loader = build_val_loader()
-    with autocast_ctx:
-        blend_bpb, blend_loss = evaluate_bpb(blend_model, val_loader, eval_steps, token_bytes)
-    print0(f"Blend({alpha:.1f}*final+{1-alpha:.1f}*EMA {ema.decay}): Val BPB: {blend_bpb:.6f} | Val Loss: {blend_loss:.6f}")
-    if blend_loss < min_val_loss:
-        min_val_loss = blend_loss
-        min_val_bpb = blend_bpb
-        print0(f"  ** New best! (from blend {alpha:.1f}/{1-alpha:.1f} with EMA {ema.decay})")
-    load_state_dict_into_model(orig_model, final_weights)
 
 # Evaluate logit (probability) average
 if logit_avg_count > 0:
@@ -1125,8 +1066,6 @@ if logit_avg_count > 0:
                 min_val_loss, min_val_bpb = wt_loss, wt_bpb
                 print0(f"  ** New best! (logit avg recency weights)")
 
-    if final_weights is not None:
-        load_state_dict_into_model(orig_model, final_weights)
 
 # Summary
 print0(f"Peak memory: {get_max_memory() / 1024 / 1024:.2f} MiB")
