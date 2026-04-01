@@ -72,6 +72,8 @@ parser.add_argument("--logit-avg-mode", type=str, default="both",
                     help="Weight scheme: equal, linear recency weighted, or compare both")
 parser.add_argument("--eval-logit-avg", action="store_true",
                     help="Skip training and only run logit-avg eval on saved checkpoints")
+parser.add_argument("--swa-last-epochs", type=int, default=3,
+                    help="SWA: cosine-cycle LR in last N epochs for checkpoint diversity (0=off)")
 args = parser.parse_args()
 
 # Resolve output path
@@ -891,6 +893,9 @@ def get_lr_multiplier(it):
 def get_muon_momentum(it):
     return (1 - min(it / 300, 1)) * 0.85 + min(it / 300, 1) * 0.95
 
+steps_per_epoch = num_iterations / args.num_epochs
+_swa_start_step = (num_iterations - args.swa_last_epochs * steps_per_epoch) if args.swa_last_epochs > 0 else -1
+
 # Training loop
 step = 0
 min_val_bpb = float("inf")
@@ -946,6 +951,11 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
 
     # Update optimizer
     lrm = get_lr_multiplier(step)
+    # SWA: cosine-cycle LR in final epochs for diverse checkpoints to average
+    if _swa_start_step >= 0 and step >= _swa_start_step:
+        cycle_pos = (step - _swa_start_step) % steps_per_epoch
+        swa_base = max(lrm, 0.05)
+        lrm = 0.05 + (swa_base - 0.05) * (1 + math.cos(math.pi * cycle_pos / steps_per_epoch)) / 2
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
         if group['kind'] == 'muon':
