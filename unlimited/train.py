@@ -1,7 +1,7 @@
 """
 Train an ensemble of language models and evaluate running ensemble val loss.
 
-Trains N models (default 10) with different random seeds, shuffling data each epoch.
+Trains N models (default 20) with different random seeds, shuffling data each epoch.
 After each model is trained, computes ensemble val loss by averaging logits across
 all models trained so far. 
 The reported ensemble metric excludes model 0, which is weaker (no distillation 
