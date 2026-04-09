@@ -79,6 +79,8 @@ parser.add_argument("--smear-gate", dest="smear_gate", action="store_true",
                     help="Blend embeddings with previous-token state using a learned gate (default: on)")
 parser.add_argument("--no-smear-gate", dest="smear_gate", action="store_false",
                     help="Disable embedding smear gate")
+parser.add_argument("--layer8-cos-aux-weight", type=float, default=1e-5,
+                    help="Aux loss weight for cosine similarity between layer 8 and final residual stream")
 parser.set_defaults(ln_scale=True, smear_gate=True)
 args = parser.parse_args()
 
@@ -203,6 +205,7 @@ class GPTConfig:
     xsa_last_n: int = 0
     ln_scale: bool = False
     smear_gate: bool = False
+    layer8_cos_aux_weight: float = 1e-5
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
@@ -448,7 +451,7 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, loss_reduction='mean'):
+    def forward(self, idx, targets=None, loss_reduction='mean', return_aux=False):
         B, T = idx.size()
         cos_sin = self.cos[:, :T], self.sin[:, :T]
         x = norm(self.transformer.wte(idx))
@@ -456,6 +459,7 @@ class GPT(nn.Module):
             x = self.smear(x)
         x0 = x
         skip_connections = []
+        layer8_res = None
         for i, block in enumerate(self.transformer.h):
             if i >= self.encoder_layers and skip_connections:
                 skip = skip_connections.pop()
@@ -463,13 +467,23 @@ class GPT(nn.Module):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.ve_projs[str(i)](x0) if str(i) in self.ve_projs else None
             x = block(x, ve, cos_sin, self.window_sizes[i])
+            if i == 7:
+                layer8_res = x
             if i < self.encoder_layers:
                 skip_connections.append(x)
+        last_layer_res = x
         x = norm(x)
         logits = self.lm_head(x)[..., :self.config.vocab_size].float()
         logits = 15 * torch.tanh(logits / 15)  # softcap
         if targets is not None:
-            return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            aux_loss = logits.new_zeros(())
+            if loss_reduction == 'mean' and layer8_res is not None:
+                aux_cos = F.cosine_similarity(layer8_res.float(), last_layer_res.detach().float(), dim=-1).mean()
+                aux_loss = 1.0 - aux_cos
+            if return_aux:
+                return ce_loss, aux_loss
+            return ce_loss
         return logits
 
 # =============================================================================
@@ -791,6 +805,7 @@ print0(f"--- Hyperparameters ---")
 print0(f"  n_layer={DEPTH}, n_embd={N_EMBD}, n_head={N_HEAD}, head_dim={HEAD_DIM}")
 print0(f"  seq_len={MAX_SEQ_LEN}, window_pattern={WINDOW_PATTERN}")
 print0(f"  xsa_last_n={DEPTH if args.xsa_last_n is None else args.xsa_last_n}, ln_scale={args.ln_scale}, smear_gate={args.smear_gate}")
+print0(f"  layer8_cos_aux_weight={args.layer8_cos_aux_weight}")
 print0(f"  total_batch_size={TOTAL_BATCH_SIZE}, device_batch_size={args.device_batch_size}")
 print0(f"  matrix_lr={MATRIX_LR}, scalar_lr={SCALAR_LR}, embedding_lr={EMBEDDING_LR}, unembedding_lr={UNEMBEDDING_LR}")
 print0(f"  weight_decay={WEIGHT_DECAY}, adam_betas={ADAM_BETAS}")
@@ -818,7 +833,8 @@ token_bytes = torch.tensor(token_bytes_list, dtype=torch.int32, device=device)
 # Build model
 config = GPTConfig(vocab_size=vocab_size, dropout=args.dropout,
                    xsa_last_n=xsa_last_n, ln_scale=args.ln_scale,
-                   smear_gate=args.smear_gate)
+                   smear_gate=args.smear_gate,
+                   layer8_cos_aux_weight=args.layer8_cos_aux_weight)
 with torch.device("meta"):
     model = GPT(config)
 model.to_empty(device=device)
@@ -879,6 +895,7 @@ min_val_bpb = float("inf")
 min_val_loss = float("inf")
 epochs_without_improvement = 0
 smooth_train_loss = 0
+smooth_aux_loss = 0
 total_training_time = 0
 eval_steps = EVAL_TOKENS // (args.device_batch_size * MAX_SEQ_LEN * ddp_world_size)
 steps_per_epoch = num_iterations / args.num_epochs
@@ -906,9 +923,11 @@ while current_epoch <= args.num_epochs:
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
-            loss = model(x, y)
+            loss, aux_loss = model(x, y, return_aux=True)
         train_loss = loss.detach()
-        (loss / grad_accum_steps).backward()
+        train_aux_loss = aux_loss.detach()
+        combined_loss = loss + args.layer8_cos_aux_weight * aux_loss
+        (combined_loss / grad_accum_steps).backward()
         x, y, epoch = next(train_loader)
 
     # Update optimizer
@@ -940,6 +959,7 @@ while current_epoch <= args.num_epochs:
     if ema_params is not None and step % args.update_ema_every == 0:
         torch._foreach_lerp_(ema_params, list(model.parameters()), 1 - param_ema_beta)
     train_loss_f = train_loss.item()
+    train_aux_loss_f = train_aux_loss.item()
     synchronize()
     dt = time.time() - t0
 
@@ -948,7 +968,9 @@ while current_epoch <= args.num_epochs:
     # Logging
     ema_beta = 0.9
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
+    smooth_aux_loss = ema_beta * smooth_aux_loss + (1 - ema_beta) * train_aux_loss_f
     debiased = smooth_train_loss / (1 - ema_beta**step)
+    debiased_aux = smooth_aux_loss / (1 - ema_beta**step)
     pct = 100 * step / num_iterations
     tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
     mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / (gpu_peak_flops * ddp_world_size)
@@ -956,8 +978,14 @@ while current_epoch <= args.num_epochs:
         total_training_time += dt
     steps_done = step - 3
     eta_str = f" | eta: {(num_iterations - step) * total_training_time / steps_done / 60:.1f}m" if steps_done > 0 else ""
-    print0(f"step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} | dt: {dt*1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}%{eta_str}")
-    wandb_run.log({"step": step, "train/loss": debiased, "train/mfu": mfu})
+    print0(f"step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} | aux: {debiased_aux:.6f} | dt: {dt*1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}%{eta_str}")
+    wandb_run.log({
+        "step": step,
+        "train/loss": debiased,
+        "train/aux_loss": debiased_aux,
+        "train/aux_loss_weighted": args.layer8_cos_aux_weight * debiased_aux,
+        "train/mfu": mfu,
+    })
 
     # Synchronize epoch across ranks (different ranks may exhaust data at different steps)
     if ddp:
