@@ -69,6 +69,17 @@ parser.add_argument("--update-ema-every", type=int, default=10)
 parser.add_argument("--ema-decay-per-epoch", type=float, default=0.15)
 parser.add_argument("--swa-last-epochs", type=int, default=4,
                     help="SWA: cosine-cycle LR in last N epochs for checkpoint diversity (0=off)")
+parser.add_argument("--xsa-last-n", type=int, default=None,
+                    help="Enable XSA on the last N layers (default: all layers, 0=off)")
+parser.add_argument("--ln-scale", dest="ln_scale", action="store_true",
+                    help="Scale block-normalized inputs by 1/sqrt(layer_idx+1) (default: on)")
+parser.add_argument("--no-ln-scale", dest="ln_scale", action="store_false",
+                    help="Disable layerwise normalization scaling")
+parser.add_argument("--smear-gate", dest="smear_gate", action="store_true",
+                    help="Blend embeddings with previous-token state using a learned gate (default: on)")
+parser.add_argument("--no-smear-gate", dest="smear_gate", action="store_false",
+                    help="Disable embedding smear gate")
+parser.set_defaults(ln_scale=True, smear_gate=True)
 args = parser.parse_args()
 
 # Resolve output path
@@ -189,6 +200,9 @@ class GPTConfig:
     n_embd: int = N_EMBD
     window_pattern: str = WINDOW_PATTERN
     dropout: float = 0.1
+    xsa_last_n: int = 0
+    ln_scale: bool = False
+    smear_gate: bool = False
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
@@ -225,6 +239,17 @@ class CausalSelfAttention(nn.Module):
         pattern = config.window_pattern.upper()
         char = pattern[layer_idx % len(pattern)]
         self.use_key_offset = (char == 'L') or (layer_idx == config.n_layer - 1)
+        self.use_xsa = False
+
+    def _xsa_efficient(self, y, v):
+        """Subtract the self-value projection without materializing repeated KV heads."""
+        B, T, H, D = y.shape
+        Hkv = v.size(-2)
+        group = H // Hkv
+        y_grouped = y.reshape(B, T, Hkv, group, D)
+        v_norm = F.normalize(v, dim=-1).unsqueeze(-2)
+        proj = (y_grouped * v_norm).sum(dim=-1, keepdim=True) * v_norm
+        return (y_grouped - proj).reshape(B, T, H, D)
 
     def forward(self, x, ve, cos_sin, window_size):
         B, T, C = x.size()
@@ -243,10 +268,22 @@ class CausalSelfAttention(nn.Module):
         if self.use_key_offset and T > 1:
             k[:, 1:, :, self.head_dim // 2:] = k[:, :-1, :, self.head_dim // 2:].clone()
         y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        if self.use_xsa:
+            y = self._xsa_efficient(y, v)
         # Per-head attention gate (sparse gated attention, zero-init → sigmoid(0)=0.5 at start)
         y = y * torch.sigmoid(self.attn_gate(x[..., :self.attn_gate_channels])).unsqueeze(-1)
         y = y.contiguous().view(B, T, -1)
         return self.resid_dropout(self.c_proj(y))
+
+class SmearGate(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.gate = nn.Parameter(torch.zeros(dim))
+
+    def forward(self, x):
+        gate = torch.sigmoid(self.gate.to(dtype=x.dtype))[None, None, :]
+        x_prev = torch.cat([torch.zeros_like(x[:, :1]), x[:, :-1]], dim=1)
+        return (1 - gate) * x + gate * x_prev
 
 
 class MLP(nn.Module):
@@ -266,10 +303,11 @@ class Block(nn.Module):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
+        self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if config.ln_scale else 1.0
 
     def forward(self, x, ve, cos_sin, window_size):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size)
-        x = x + self.mlp(norm(x))
+        x = x + self.attn(norm(x) * self.ln_scale_factor, ve, cos_sin, window_size)
+        x = x + self.mlp(norm(x) * self.ln_scale_factor)
         return x
 
 
@@ -285,6 +323,7 @@ class GPT(nn.Module):
             "wte": nn.Embedding(padded_vocab, config.n_embd),
             "h": nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
         })
+        self.smear = SmearGate(config.n_embd) if config.smear_gate else None
         self.lm_head = nn.Linear(config.n_embd, padded_vocab, bias=False)
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
@@ -298,6 +337,9 @@ class GPT(nn.Module):
         cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim)
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
+        if config.xsa_last_n > 0:
+            for i in range(max(0, config.n_layer - config.xsa_last_n), config.n_layer):
+                self.transformer.h[i].attn.use_xsa = True
 
     @torch.no_grad()
     def init_weights(self):
@@ -321,6 +363,8 @@ class GPT(nn.Module):
             if block.attn.ve_gate is not None:
                 torch.nn.init.zeros_(block.attn.ve_gate.weight)
             torch.nn.init.zeros_(block.attn.attn_gate.weight)
+        if self.smear is not None:
+            self.smear.gate.zero_()
         self.skip_weights.fill_(1.0)
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary(self.rotary_seq_len, head_dim)
@@ -364,6 +408,8 @@ class GPT(nn.Module):
                           + self.resid_lambdas.numel()
                           + self.x0_lambdas.numel()
                           + self.skip_weights.numel())
+        if self.smear is not None:
+            nparams_exclude += self.smear.gate.numel()
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
         # Exact causal sliding-window attention FLOPs: 12 * h * q * E[keys attended per query]
         attn_flops = sum(12 * h * q * self._avg_causal_attended_keys(w[0], t) for w in self.window_sizes)
@@ -381,6 +427,7 @@ class GPT(nn.Module):
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         skip_params = [self.skip_weights]
+        smear_params = list(self.smear.parameters()) if self.smear is not None else []
 
         param_groups = [
             dict(kind='adamw', params=lm_head_params, lr=UNEMBEDDING_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=WEIGHT_DECAY),
@@ -388,6 +435,7 @@ class GPT(nn.Module):
             dict(kind='adamw', params=resid_params, lr=SCALAR_LR * 0.01, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=SCALAR_LR, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=skip_params, lr=SCALAR_LR * 0.01, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=smear_params, lr=SCALAR_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=attn_gate_params, lr=SCALAR_LR, betas=(0.9, 0.99), eps=1e-10, weight_decay=0.0),
         ]
         for shape in sorted({p.shape for p in matrix_params}):
@@ -404,6 +452,8 @@ class GPT(nn.Module):
         B, T = idx.size()
         cos_sin = self.cos[:, :T], self.sin[:, :T]
         x = norm(self.transformer.wte(idx))
+        if self.smear is not None:
+            x = self.smear(x)
         x0 = x
         skip_connections = []
         for i, block in enumerate(self.transformer.h):
@@ -740,6 +790,7 @@ if master_process:
 print0(f"--- Hyperparameters ---")
 print0(f"  n_layer={DEPTH}, n_embd={N_EMBD}, n_head={N_HEAD}, head_dim={HEAD_DIM}")
 print0(f"  seq_len={MAX_SEQ_LEN}, window_pattern={WINDOW_PATTERN}")
+print0(f"  xsa_last_n={DEPTH if args.xsa_last_n is None else args.xsa_last_n}, ln_scale={args.ln_scale}, smear_gate={args.smear_gate}")
 print0(f"  total_batch_size={TOTAL_BATCH_SIZE}, device_batch_size={args.device_batch_size}")
 print0(f"  matrix_lr={MATRIX_LR}, scalar_lr={SCALAR_LR}, embedding_lr={EMBEDDING_LR}, unembedding_lr={UNEMBEDDING_LR}")
 print0(f"  weight_decay={WEIGHT_DECAY}, adam_betas={ADAM_BETAS}")
@@ -752,6 +803,8 @@ print0(f"-----------------------")
 encoder = tiktoken.get_encoding("gpt2")
 vocab_size = encoder.n_vocab  # 50257
 print0(f"Vocab size: {vocab_size:,}")
+xsa_last_n = DEPTH if args.xsa_last_n is None else args.xsa_last_n
+print0(f"  effective_xsa_last_n={xsa_last_n}")
 
 eot_id = encoder._special_tokens['<|endoftext|>']
 token_bytes_list = []
@@ -763,7 +816,9 @@ for i in range(vocab_size):
 token_bytes = torch.tensor(token_bytes_list, dtype=torch.int32, device=device)
 
 # Build model
-config = GPTConfig(vocab_size=vocab_size, dropout=args.dropout)
+config = GPTConfig(vocab_size=vocab_size, dropout=args.dropout,
+                   xsa_last_n=xsa_last_n, ln_scale=args.ln_scale,
+                   smear_gate=args.smear_gate)
 with torch.device("meta"):
     model = GPT(config)
 model.to_empty(device=device)
