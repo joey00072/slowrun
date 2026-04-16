@@ -69,6 +69,20 @@ parser.add_argument("--update-ema-every", type=int, default=10)
 parser.add_argument("--ema-decay-per-epoch", type=float, default=0.15)
 parser.add_argument("--swa-last-epochs", type=int, default=4,
                     help="SWA: cosine-cycle LR in last N epochs for checkpoint diversity (0=off)")
+# NCA pre-pre-training (Stage 2 args)
+parser.add_argument("--nca-checkpoint", type=str, default=None,
+                    help="Path to NCA pre-pretrained checkpoint (Stage 1 output). "
+                         "Re-inits wte/lm_head for language vocab; transfers all other weights.")
+parser.add_argument("--nca-no-reinit-embed", action="store_true",
+                    help="If set, do NOT re-init embed/lm_head after loading NCA checkpoint "
+                         "(only useful if vocab sizes happen to match, which they won't normally).")
+parser.add_argument("--nca-bridge-steps", type=int, default=0,
+                    help="If >0 and --nca-checkpoint is set, train only token embeddings + lm_head for this many initial optimizer steps before unfreezing the trunk.")
+parser.add_argument("--nca-bridge-lr-scale", type=float, default=1.0,
+                    help="LR multiplier applied to embedding/lm_head during the NCA bridge phase.")
+parser.add_argument("--nca-transfer-mode", type=str, default="full",
+                    choices=["full", "top-half", "attn-only", "top-half-attn-only"],
+                    help="Subset of NCA trunk parameters to transfer.")
 args = parser.parse_args()
 
 # Resolve output path
@@ -108,6 +122,36 @@ ADAM_BETAS = (0.8, 0.95)
 WARMUP_RATIO = 0.0
 WARMDOWN_RATIO = args.warmdown_ratio
 FINAL_LR_FRAC = 0.0
+
+
+def should_transfer_nca_param(name):
+    mode = args.nca_transfer_mode
+    if mode == "full":
+        return True
+    if name in {"resid_lambdas", "x0_lambdas", "skip_weights"}:
+        return True
+    if name.startswith("transformer.h."):
+        parts = name.split(".")
+        layer_idx = int(parts[2])
+        is_top_half = layer_idx >= DEPTH // 2
+        is_attn = ".attn." in name
+        if mode == "top-half":
+            return is_top_half
+        if mode == "attn-only":
+            return is_attn
+        if mode == "top-half-attn-only":
+            return is_top_half and is_attn
+    if name.startswith("ve_projs."):
+        parts = name.split(".")
+        layer_idx = int(parts[1])
+        is_top_half = layer_idx >= DEPTH // 2
+        if mode == "top-half":
+            return is_top_half
+        if mode == "attn-only":
+            return True
+        if mode == "top-half-attn-only":
+            return is_top_half
+    return False
 
 # =============================================================================
 # Utilities
@@ -383,16 +427,16 @@ class GPT(nn.Module):
         skip_params = [self.skip_weights]
 
         param_groups = [
-            dict(kind='adamw', params=lm_head_params, lr=UNEMBEDDING_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=WEIGHT_DECAY),
-            dict(kind='adamw', params=embed_params, lr=EMBEDDING_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=WEIGHT_DECAY),
-            dict(kind='adamw', params=resid_params, lr=SCALAR_LR * 0.01, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=x0_params, lr=SCALAR_LR, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=skip_params, lr=SCALAR_LR * 0.01, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=attn_gate_params, lr=SCALAR_LR, betas=(0.9, 0.99), eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', role='lm_head', bridge_trainable=True, params=lm_head_params, lr=UNEMBEDDING_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=WEIGHT_DECAY),
+            dict(kind='adamw', role='embed', bridge_trainable=True, params=embed_params, lr=EMBEDDING_LR, betas=ADAM_BETAS, eps=1e-10, weight_decay=WEIGHT_DECAY),
+            dict(kind='adamw', role='resid', bridge_trainable=False, params=resid_params, lr=SCALAR_LR * 0.01, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', role='x0', bridge_trainable=False, params=x0_params, lr=SCALAR_LR, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', role='skip', bridge_trainable=False, params=skip_params, lr=SCALAR_LR * 0.01, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', role='attn_gate', bridge_trainable=False, params=attn_gate_params, lr=SCALAR_LR, betas=(0.9, 0.99), eps=1e-10, weight_decay=0.0),
         ]
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
-            param_groups.append(dict(kind='muon', params=group_params, lr=MATRIX_LR,
+            param_groups.append(dict(kind='muon', role='matrix', bridge_trainable=False, params=group_params, lr=MATRIX_LR,
                                      momentum=0.95, ns_steps=5, beta2=0.95, weight_decay=WEIGHT_DECAY))
 
         optimizer = DistMuonAdamW(param_groups)
@@ -746,6 +790,11 @@ print0(f"  weight_decay={WEIGHT_DECAY}, adam_betas={ADAM_BETAS}")
 print0(f"  warmup_ratio={WARMUP_RATIO}, warmdown_ratio={WARMDOWN_RATIO}, final_lr_frac={FINAL_LR_FRAC}")
 print0(f"  num_epochs={args.num_epochs}, patience={args.patience}")
 print0(f"  dropout={args.dropout}")
+if args.nca_checkpoint:
+    print0(f"  *** NCA pre-pretraining Stage 2 ***")
+    print0(f"  nca_checkpoint={args.nca_checkpoint}")
+    print0(f"  nca_reinit_embed={not args.nca_no_reinit_embed}")
+    print0(f"  nca_transfer_mode={args.nca_transfer_mode}")
 print0(f"-----------------------")
 
 # Load GPT-2 tokenizer and compute token_bytes for BPB evaluation
@@ -768,6 +817,69 @@ with torch.device("meta"):
     model = GPT(config)
 model.to_empty(device=device)
 model.init_weights()
+
+# -----------------------------------------------------------------------
+# NCA Pre-Pre-Training: Stage 2 weight transfer
+# Load NCA checkpoint and transfer all weights EXCEPT wte + lm_head.
+# The paper says: re-init embedding layers, keep all other weights.
+# This allows attention/MLP to leverage spatiotemporal representations
+# learned from NCA dynamics.
+# -----------------------------------------------------------------------
+if args.nca_checkpoint:
+    print0(f"Loading NCA pre-pretrained weights from: {args.nca_checkpoint}")
+    nca_ckpt = torch.load(args.nca_checkpoint, map_location="cpu", weights_only=True)
+    reinit_embed = not args.nca_no_reinit_embed
+    # Track transfer stats
+    transferred, skipped, shape_mismatch, filtered = [], [], [], []
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            if name not in nca_ckpt:
+                skipped.append(name)
+                continue
+            if not should_transfer_nca_param(name):
+                filtered.append(name)
+                continue
+            ckpt_tensor = nca_ckpt[name]
+            if ckpt_tensor.shape != param.shape:
+                # Embeddings & lm_head will always mismatch (different vocab sizes)
+                shape_mismatch.append(f"{name}: ckpt {tuple(ckpt_tensor.shape)} vs model {tuple(param.shape)}")
+                if reinit_embed:
+                    # Keep model's random init (already done by init_weights)
+                    skipped.append(name)
+                else:
+                    # Try to copy overlapping rows/cols
+                    min_rows = min(ckpt_tensor.shape[0], param.shape[0])
+                    if ckpt_tensor.dim() == 2:
+                        min_cols = min(ckpt_tensor.shape[1], param.shape[1])
+                        param[:min_rows, :min_cols].copy_(
+                            ckpt_tensor[:min_rows, :min_cols].to(param.device, param.dtype))
+                    else:
+                        param[:min_rows].copy_(
+                            ckpt_tensor[:min_rows].to(param.device, param.dtype))
+                    transferred.append(name + " (partial)")
+            else:
+                # Clean transfer — same shape
+                param.copy_(ckpt_tensor.to(param.device, param.dtype))
+                transferred.append(name)
+    print0(f"  Transferred: {len(transferred)} parameters")
+    if filtered:
+        print0(f"  Filtered by transfer mode: {len(filtered)}")
+    print0(f"  Skipped (shape mismatch / re-init): {len(shape_mismatch)}")
+    for m in shape_mismatch:
+        print0(f"    {m}")
+    if skipped:
+        print0(f"  Skipped (not in ckpt): {len(skipped) - len(shape_mismatch)}")
+    if reinit_embed:
+        # Re-initialize wte and lm_head with fresh random weights for language vocab
+        s = 3**0.5 * config.n_embd**-0.5
+        torch.nn.init.normal_(model.transformer.wte.weight, mean=0.0, std=1.0)
+        torch.nn.init.normal_(model.lm_head.weight, mean=0.0, std=0.001)
+        if model.transformer.wte.weight.device.type == "cuda":
+            model.transformer.wte.to(dtype=torch.bfloat16)
+        print0(f"  Re-initialized: wte, lm_head (language vocab = {vocab_size})")
+    del nca_ckpt
+    import gc as _gc; _gc.collect()
+    print0(f"NCA weight transfer complete.")
 
 param_counts = sum(p.numel() for p in model.parameters())
 transformer_params = sum(p.numel() for p in model.transformer.h.parameters())
@@ -804,6 +916,12 @@ wd_phase2_end_step = round(args.wd_phase2_epoch / args.num_epochs * num_iteratio
 print0(f"Batch size: {TOTAL_BATCH_SIZE:,} tokens, grad accum: {grad_accum_steps} steps")
 print0(f"Training for {args.num_epochs} epoch(s) (~{num_iterations} steps estimated)")
 print0(f"Eval set: {EVAL_TOKENS:,} tokens")
+bridge_steps = args.nca_bridge_steps if args.nca_checkpoint else 0
+if bridge_steps > 0:
+    print0(
+        f"NCA bridge: {bridge_steps} step(s), training only embed/lm_head "
+        f"with lr scale {args.nca_bridge_lr_scale}"
+    )
 
 # Schedulers
 def get_lr_multiplier(it):
@@ -873,8 +991,20 @@ while current_epoch <= args.num_epochs:
     # Convert to a scale factor;
     # groups with weight_decay=0.0 (scalar params) correctly stay at zero.
     wd_scale = wd / args.weight_decay if args.weight_decay > 0 else 0.0
+    bridge_active = bridge_steps > 0 and step < bridge_steps
+    if bridge_active and step == 0:
+        print0("Bridge phase active: trunk frozen")
+    if bridge_steps > 0 and step == bridge_steps:
+        print0("Bridge phase complete: unfreezing full model")
     for group in optimizer.param_groups:
-        group["lr"] = group["initial_lr"] * lrm
+        base_lr = group["initial_lr"] * lrm
+        if bridge_active:
+            if group.get("bridge_trainable", False):
+                group["lr"] = base_lr * args.nca_bridge_lr_scale
+            else:
+                group["lr"] = 0.0
+        else:
+            group["lr"] = base_lr
         if "initial_wd" not in group:
             group["initial_wd"] = group.get("weight_decay", 0.0)
         group["weight_decay"] = group["initial_wd"] * wd_scale

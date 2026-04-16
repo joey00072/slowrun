@@ -78,6 +78,12 @@ parser.add_argument("--swa-last-epochs", type=int, default=3,
                     help="SWA: cosine-cycle LR in last N epochs for checkpoint diversity (0=off)")
 parser.add_argument("--stoch-depth", type=float, default=0.05,
                     help="Stochastic depth max drop rate (linear schedule, 0=off)")
+# NCA pre-pre-training (Stage 2 args)
+parser.add_argument("--nca-checkpoint", type=str, default=None,
+                    help="Path to NCA pre-pretrained checkpoint (Stage 1 output). "
+                         "Re-inits wte/lm_head for language vocab; transfers all other weights.")
+parser.add_argument("--nca-no-reinit-embed", action="store_true",
+                    help="If set, do NOT re-init embed/lm_head after loading NCA checkpoint.")
 args = parser.parse_args()
 
 # Resolve output path
@@ -843,6 +849,10 @@ print0(f"  weight_decay={WEIGHT_DECAY}, adam_betas={ADAM_BETAS}")
 print0(f"  warmup_ratio={WARMUP_RATIO}, warmdown_ratio={WARMDOWN_RATIO}, final_lr_frac={FINAL_LR_FRAC}")
 print0(f"  num_epochs={args.num_epochs}, patience={args.patience}")
 print0(f"  dropout={args.dropout}")
+if args.nca_checkpoint:
+    print0(f"  *** NCA pre-pretraining Stage 2 ***")
+    print0(f"  nca_checkpoint={args.nca_checkpoint}")
+    print0(f"  nca_reinit_embed={not args.nca_no_reinit_embed}")
 print0(f"-----------------------")
 
 # Load GPT-2 tokenizer and compute token_bytes for BPB evaluation
@@ -866,6 +876,53 @@ with torch.device("meta"):
     model = GPT(config)
 model.to_empty(device=device)
 model.init_weights()
+
+# -----------------------------------------------------------------------
+# NCA Pre-Pre-Training: Stage 2 weight transfer
+# Load NCA checkpoint and transfer all weights EXCEPT wte + lm_head.
+# The paper says: re-init embedding layers, keep all other weights.
+# -----------------------------------------------------------------------
+if args.nca_checkpoint:
+    print0(f"Loading NCA pre-pretrained weights from: {args.nca_checkpoint}")
+    nca_ckpt = torch.load(args.nca_checkpoint, map_location="cpu", weights_only=True)
+    reinit_embed = not args.nca_no_reinit_embed
+    transferred, skipped, shape_mismatch = [], [], []
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            if name not in nca_ckpt:
+                skipped.append(name)
+                continue
+            ckpt_tensor = nca_ckpt[name]
+            if ckpt_tensor.shape != param.shape:
+                shape_mismatch.append(f"{name}: ckpt {tuple(ckpt_tensor.shape)} vs model {tuple(param.shape)}")
+                if reinit_embed:
+                    skipped.append(name)
+                else:
+                    min_rows = min(ckpt_tensor.shape[0], param.shape[0])
+                    if ckpt_tensor.dim() == 2:
+                        min_cols = min(ckpt_tensor.shape[1], param.shape[1])
+                        param[:min_rows, :min_cols].copy_(
+                            ckpt_tensor[:min_rows, :min_cols].to(param.device, param.dtype))
+                    else:
+                        param[:min_rows].copy_(
+                            ckpt_tensor[:min_rows].to(param.device, param.dtype))
+                    transferred.append(name + " (partial)")
+            else:
+                param.copy_(ckpt_tensor.to(param.device, param.dtype))
+                transferred.append(name)
+    print0(f"  Transferred: {len(transferred)} parameters")
+    print0(f"  Skipped (shape mismatch / re-init): {len(shape_mismatch)}")
+    for m in shape_mismatch:
+        print0(f"    {m}")
+    if reinit_embed:
+        torch.nn.init.normal_(model.transformer.wte.weight, mean=0.0, std=1.0)
+        torch.nn.init.normal_(model.lm_head.weight, mean=0.0, std=0.001)
+        if model.transformer.wte.weight.device.type == "cuda":
+            model.transformer.wte.to(dtype=torch.bfloat16)
+        print0(f"  Re-initialized: wte, lm_head (language vocab = {vocab_size})")
+    del nca_ckpt
+    import gc as _gc; _gc.collect()
+    print0(f"NCA weight transfer complete.")
 
 param_counts = sum(p.numel() for p in model.parameters())
 transformer_params = sum(p.numel() for p in model.transformer.h.parameters())
