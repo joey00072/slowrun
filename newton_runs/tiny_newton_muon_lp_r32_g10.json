@@ -1,0 +1,9 @@
+{
+  "optimizer": "newton_muon",
+  "matrix_lr": 0.04,
+  "weight_decay": 0.8,
+  "num_epochs": 16,
+  "val_loss": 3.3645659998843542,
+  "best_val_loss": 3.347883525647615,
+  "wandb_url": null
+}

@@ -40,6 +40,7 @@ parser.add_argument("--device-batch-size", type=int, default=32)
 parser.add_argument("--num-epochs", type=int, default=16)
 parser.add_argument("--patience", type=int, default=-1)
 parser.add_argument("--run", type=str, default=None)
+parser.add_argument("--optimizer", type=str, default="muon", choices=["muon", "newton_muon"])
 parser.add_argument("--scalar-lr", type=float, default=0.25)
 parser.add_argument("--matrix-lr", type=float, default=0.04)
 parser.add_argument("--embedding-lr", type=float, default=0.15)
@@ -69,6 +70,12 @@ parser.add_argument("--update-ema-every", type=int, default=10)
 parser.add_argument("--ema-decay-per-epoch", type=float, default=0.15)
 parser.add_argument("--swa-last-epochs", type=int, default=4,
                     help="SWA: cosine-cycle LR in last N epochs for checkpoint diversity (0=off)")
+parser.add_argument("--newton-refresh-interval", type=int, default=32)
+parser.add_argument("--newton-ewma", type=float, default=0.95)
+parser.add_argument("--newton-ridge-mult", type=float, default=0.2)
+parser.add_argument("--newton-init-diag", type=float, default=1e-3)
+parser.add_argument("--newton-eps", type=float, default=1e-8)
+parser.add_argument("--newton-block-size", type=int, default=256)
 args = parser.parse_args()
 
 # Resolve output path
@@ -108,6 +115,13 @@ ADAM_BETAS = (0.8, 0.95)
 WARMUP_RATIO = 0.0
 WARMDOWN_RATIO = args.warmdown_ratio
 FINAL_LR_FRAC = 0.0
+OPTIMIZER_KIND = args.optimizer
+NEWTON_REFRESH_INTERVAL = args.newton_refresh_interval
+NEWTON_EWMA = args.newton_ewma
+NEWTON_RIDGE_MULT = args.newton_ridge_mult
+NEWTON_INIT_DIAG = args.newton_init_diag
+NEWTON_EPS = args.newton_eps
+NEWTON_BLOCK_SIZE = args.newton_block_size
 
 # =============================================================================
 # Utilities
@@ -193,6 +207,31 @@ class GPTConfig:
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
 
+def choose_block_size(width, preferred):
+    if width % preferred == 0:
+        return preferred
+    for block_size in range(preferred, 0, -1):
+        if width % block_size == 0:
+            return block_size
+    return 1
+
+@torch.no_grad()
+def accumulate_xtx(accum, count, x):
+    x2d = x.reshape(-1, x.shape[-1]).float()
+    if x2d.numel() == 0:
+        return
+    accum.add_(x2d.mT @ x2d, alpha=1.0 / x2d.shape[0])
+    count.add_(1.0)
+
+@torch.no_grad()
+def accumulate_xtx_blockdiag(accum, count, x, block_size):
+    x2d = x.reshape(-1, x.shape[-1]).float()
+    if x2d.numel() == 0:
+        return
+    blocks = x2d.view(x2d.shape[0], -1, block_size).permute(1, 0, 2).contiguous()
+    accum.add_(torch.bmm(blocks.transpose(1, 2), blocks), alpha=1.0 / x2d.shape[0])
+    count.add_(1.0)
+
 def has_ve(layer_idx, n_layer):
     """Value Embedding on alternating layers, last layer always included."""
     return layer_idx % 2 == (n_layer - 1) % 2
@@ -225,9 +264,25 @@ class CausalSelfAttention(nn.Module):
         pattern = config.window_pattern.upper()
         char = pattern[layer_idx % len(pattern)]
         self.use_key_offset = (char == 'L') or (layer_idx == config.n_layer - 1)
+        d = self.n_embd
+        self.register_buffer("qkv_xtx_accum", torch.zeros(d, d, dtype=torch.float32), persistent=False)
+        self.register_buffer("qkv_xtx_count", torch.zeros((), dtype=torch.float32), persistent=False)
+        self.register_buffer("o_xtx_accum", torch.zeros(d, d, dtype=torch.float32), persistent=False)
+        self.register_buffer("o_xtx_count", torch.zeros((), dtype=torch.float32), persistent=False)
+        self._set_newton_stats_refs()
 
-    def forward(self, x, ve, cos_sin, window_size):
+    def _set_newton_stats_refs(self):
+        qkv_ref = {"kind": "full", "accum": self.qkv_xtx_accum, "count": self.qkv_xtx_count}
+        out_ref = {"kind": "full", "accum": self.o_xtx_accum, "count": self.o_xtx_count}
+        self.c_q.weight._newton_stats_ref = qkv_ref
+        self.c_k.weight._newton_stats_ref = qkv_ref
+        self.c_v.weight._newton_stats_ref = qkv_ref
+        self.c_proj.weight._newton_stats_ref = out_ref
+
+    def forward(self, x, ve, cos_sin, window_size, precond_flag=False):
         B, T, C = x.size()
+        if precond_flag:
+            accumulate_xtx(self.qkv_xtx_accum, self.qkv_xtx_count, x)
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
         k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
         v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
@@ -246,7 +301,14 @@ class CausalSelfAttention(nn.Module):
         # Per-head attention gate (sparse gated attention, zero-init → sigmoid(0)=0.5 at start)
         y = y * torch.sigmoid(self.attn_gate(x[..., :self.attn_gate_channels])).unsqueeze(-1)
         y = y.contiguous().view(B, T, -1)
+        if precond_flag:
+            accumulate_xtx(self.o_xtx_accum, self.o_xtx_count, y)
         return self.resid_dropout(self.c_proj(y))
+
+    def _apply(self, fn):
+        super()._apply(fn)
+        self._set_newton_stats_refs()
+        return self
 
 
 class MLP(nn.Module):
@@ -256,9 +318,43 @@ class MLP(nn.Module):
         self.c_gate = nn.Linear(config.n_embd, hidden, bias=False)
         self.c_fc = nn.Linear(config.n_embd, hidden, bias=False)
         self.c_proj = nn.Linear(hidden, config.n_embd, bias=False)
+        self.newton_block_size = choose_block_size(hidden, NEWTON_BLOCK_SIZE)
+        self.newton_num_blocks = hidden // self.newton_block_size
+        d = config.n_embd
+        self.register_buffer("fc_xtx_accum", torch.zeros(d, d, dtype=torch.float32), persistent=False)
+        self.register_buffer("fc_xtx_count", torch.zeros((), dtype=torch.float32), persistent=False)
+        self.register_buffer(
+            "proj_xtx_accum",
+            torch.zeros(self.newton_num_blocks, self.newton_block_size, self.newton_block_size, dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer("proj_xtx_count", torch.zeros((), dtype=torch.float32), persistent=False)
+        self._set_newton_stats_refs()
 
-    def forward(self, x):
-        return self.c_proj(F.silu(self.c_gate(x)) * self.c_fc(x))
+    def _set_newton_stats_refs(self):
+        fc_ref = {"kind": "full", "accum": self.fc_xtx_accum, "count": self.fc_xtx_count}
+        proj_ref = {
+            "kind": "blockdiag",
+            "accum": self.proj_xtx_accum,
+            "count": self.proj_xtx_count,
+            "block_size": self.newton_block_size,
+        }
+        self.c_gate.weight._newton_stats_ref = fc_ref
+        self.c_fc.weight._newton_stats_ref = fc_ref
+        self.c_proj.weight._newton_stats_ref = proj_ref
+
+    def forward(self, x, precond_flag=False):
+        if precond_flag:
+            accumulate_xtx(self.fc_xtx_accum, self.fc_xtx_count, x)
+        x = F.silu(self.c_gate(x)) * self.c_fc(x)
+        if precond_flag:
+            accumulate_xtx_blockdiag(self.proj_xtx_accum, self.proj_xtx_count, x, self.newton_block_size)
+        return self.c_proj(x)
+
+    def _apply(self, fn):
+        super()._apply(fn)
+        self._set_newton_stats_refs()
+        return self
 
 
 class Block(nn.Module):
@@ -267,9 +363,9 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size)
-        x = x + self.mlp(norm(x))
+    def forward(self, x, ve, cos_sin, window_size, precond_flag=False):
+        x = x + self.attn(norm(x), ve, cos_sin, window_size, precond_flag=precond_flag)
+        x = x + self.mlp(norm(x), precond_flag=precond_flag)
         return x
 
 
@@ -376,6 +472,20 @@ class GPT(nn.Module):
         attn_gate_ids = {id(p) for p in attn_gate_params}
         all_h_params = list(self.transformer.h.parameters()) + list(self.ve_projs.parameters())
         matrix_params = [p for p in all_h_params if id(p) not in attn_gate_ids]
+        newton_ids = set()
+        if OPTIMIZER_KIND == "newton_muon":
+            for block in self.transformer.h:
+                newton_ids.update({
+                    id(block.attn.c_q.weight),
+                    id(block.attn.c_k.weight),
+                    id(block.attn.c_v.weight),
+                    id(block.attn.c_proj.weight),
+                    id(block.mlp.c_gate.weight),
+                    id(block.mlp.c_fc.weight),
+                    id(block.mlp.c_proj.weight),
+                })
+        newton_params = [p for p in matrix_params if id(p) in newton_ids]
+        muon_params = [p for p in matrix_params if id(p) not in newton_ids]
         embed_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
@@ -390,9 +500,13 @@ class GPT(nn.Module):
             dict(kind='adamw', params=skip_params, lr=SCALAR_LR * 0.01, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=attn_gate_params, lr=SCALAR_LR, betas=(0.9, 0.99), eps=1e-10, weight_decay=0.0),
         ]
-        for shape in sorted({p.shape for p in matrix_params}):
-            group_params = [p for p in matrix_params if p.shape == shape]
+        for shape in sorted({p.shape for p in muon_params}):
+            group_params = [p for p in muon_params if p.shape == shape]
             param_groups.append(dict(kind='muon', params=group_params, lr=MATRIX_LR,
+                                     momentum=0.95, ns_steps=5, beta2=0.95, weight_decay=WEIGHT_DECAY))
+        for shape in sorted({p.shape for p in newton_params}):
+            group_params = [p for p in newton_params if p.shape == shape]
+            param_groups.append(dict(kind='newton_muon', params=group_params, lr=MATRIX_LR,
                                      momentum=0.95, ns_steps=5, beta2=0.95, weight_decay=WEIGHT_DECAY))
 
         optimizer = DistMuonAdamW(param_groups)
@@ -400,7 +514,7 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, loss_reduction='mean'):
+    def forward(self, idx, targets=None, loss_reduction='mean', precond_flag=False):
         B, T = idx.size()
         cos_sin = self.cos[:, :T], self.sin[:, :T]
         x = norm(self.transformer.wte(idx))
@@ -412,7 +526,7 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i - self.encoder_layers] * skip
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.ve_projs[str(i)](x0) if str(i) in self.ve_projs else None
-            x = block(x, ve, cos_sin, self.window_sizes[i])
+            x = block(x, ve, cos_sin, self.window_sizes[i], precond_flag=precond_flag)
             if i < self.encoder_layers:
                 skip_connections.append(x)
         x = norm(x)
@@ -480,6 +594,19 @@ def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momen
     mask = (g * stacked_params) >= 0
     stacked_params.sub_(lr * g + lr * wd * stacked_params * mask)
 
+@torch.no_grad()
+def apply_newton_precond_(grad, inv, kind):
+    if kind == "full":
+        grad.copy_((grad.float() @ inv).to(grad.dtype))
+        return
+    if kind == "blockdiag":
+        n_blocks, block_size = inv.shape[0], inv.shape[-1]
+        blocks = grad.float().view(grad.shape[0], n_blocks, block_size).permute(1, 0, 2).contiguous()
+        blocks = torch.bmm(blocks, inv)
+        grad.copy_(blocks.permute(1, 0, 2).reshape_as(grad).to(grad.dtype))
+        return
+    raise ValueError(f"Unknown Newton preconditioner kind: {kind}")
+
 
 class DistMuonAdamW(torch.optim.Optimizer):
     """Distributed MuonAdamW with ZeRO-2 style sharding."""
@@ -495,6 +622,101 @@ class DistMuonAdamW(torch.optim.Optimizer):
         self._muon_lr_t = torch.tensor(0.0)
         self._muon_wd_t = torch.tensor(0.0)
         self._muon_beta2_t = torch.tensor(0.0)
+        self.global_step = 0
+
+    def _iter_newton_params_with_stats(self):
+        for group in self.param_groups:
+            if group['kind'] != 'newton_muon':
+                continue
+            for p in group['params']:
+                stref = getattr(p, "_newton_stats_ref", None)
+                if stref is not None:
+                    yield p, stref
+
+    def _iter_unique_newton_stats(self):
+        seen = set()
+        for _, stref in self._iter_newton_params_with_stats():
+            if id(stref) in seen:
+                continue
+            seen.add(id(stref))
+            yield stref
+
+    def has_newton_groups(self):
+        return any(group['kind'] == 'newton_muon' for group in self.param_groups)
+
+    def precond_flag_for_step(self, step):
+        if not self.has_newton_groups():
+            return False
+        return ((step + 1) % NEWTON_REFRESH_INTERVAL) == 0
+
+    def _init_newton_state(self, p, stref):
+        state = self.state[p]
+        if "newton_kind" in state:
+            return
+        kind = stref["kind"]
+        state["newton_kind"] = kind
+        if kind == "full":
+            cov = torch.zeros_like(stref["accum"])
+            cov.diagonal().fill_(NEWTON_INIT_DIAG)
+            inv = torch.eye(cov.shape[-1], device=cov.device, dtype=torch.float32)
+        elif kind == "blockdiag":
+            cov = torch.zeros_like(stref["accum"])
+            cov.diagonal(dim1=-2, dim2=-1).fill_(NEWTON_INIT_DIAG)
+            inv = torch.zeros_like(cov)
+            inv.diagonal(dim1=-2, dim2=-1).fill_(1.0)
+        else:
+            raise ValueError(f"Unknown Newton stats kind: {kind}")
+        state["newton_cov"] = cov
+        state["newton_inv"] = inv
+
+    def _sync_newton_stats(self):
+        world_size = dist.get_world_size()
+        if world_size == 1:
+            return
+        for stref in self._iter_unique_newton_stats():
+            dist.all_reduce(stref["accum"], op=dist.ReduceOp.SUM)
+            dist.all_reduce(stref["count"], op=dist.ReduceOp.SUM)
+
+    def _invert_newton_cov(self, cov):
+        mat = cov.clone()
+        if mat.ndim == 2:
+            d = mat.shape[-1]
+            diag = mat.diagonal()
+            ridge = (diag.sum() / float(d)) * NEWTON_RIDGE_MULT + NEWTON_EPS
+            diag.add_(ridge)
+            L, info = torch.linalg.cholesky_ex(mat, upper=False, check_errors=False)
+            if info.item() != 0:
+                eye = torch.eye(d, device=mat.device, dtype=mat.dtype)
+                return eye
+            return torch.cholesky_inverse(L, upper=False)
+        d = mat.shape[-1]
+        diag = mat.diagonal(dim1=-2, dim2=-1)
+        ridge = (diag.sum(dim=-1) / float(d)) * NEWTON_RIDGE_MULT + NEWTON_EPS
+        diag.add_(ridge.unsqueeze(-1))
+        L, info = torch.linalg.cholesky_ex(mat, upper=False, check_errors=False)
+        inv = torch.empty_like(mat)
+        torch.cholesky_inverse(L, upper=False, out=inv)
+        bad = info != 0
+        if bad.any():
+            inv[bad].zero_()
+            inv[bad].diagonal(dim1=-2, dim2=-1).fill_(1.0)
+        return inv
+
+    def _refresh_newton_preconds(self):
+        if not self.has_newton_groups():
+            return
+        self._sync_newton_stats()
+        for p, stref in self._iter_newton_params_with_stats():
+            self._init_newton_state(p, stref)
+            state = self.state[p]
+            count = stref["count"].item()
+            if count > 0:
+                avg = stref["accum"] / count
+                state["newton_cov"].lerp_(avg, 1.0 - NEWTON_EWMA)
+            state["newton_inv"].copy_(self._invert_newton_cov(state["newton_cov"]))
+        for stref in self._iter_unique_newton_stats():
+            stref["accum"].zero_()
+            stref["count"].zero_()
 
     def _reduce_adamw(self, group, world_size):
         infos = {}
@@ -586,21 +808,66 @@ class DistMuonAdamW(torch.optim.Optimizer):
         future = dist.all_gather_into_tensor(stacked_params, updated, async_op=True).get_future()
         gather_list.append(dict(future=future, stacked_params=stacked_params, params=params))
 
+    def _compute_newton_muon(self, group, info, gather_list, rank):
+        info['future'].wait()
+        params = group['params']
+        chunk_size = info['chunk_size']
+        p = params[0]
+        shape, device, dtype = p.shape, p.device, p.dtype
+        start_idx = rank * chunk_size
+        num_owned = min(chunk_size, max(0, len(params) - start_idx))
+        state = self.state[p]
+        if "momentum_buffer" not in state:
+            state["momentum_buffer"] = torch.zeros(chunk_size, *shape, dtype=dtype, device=device)
+        if "second_momentum_buffer" not in state:
+            s = (chunk_size, shape[-2], 1) if shape[-2] >= shape[-1] else (chunk_size, 1, shape[-1])
+            state["second_momentum_buffer"] = torch.zeros(s, dtype=dtype, device=device)
+        red_dim = -1 if shape[-2] >= shape[-1] else -2
+        updated = torch.empty(chunk_size, *shape, dtype=dtype, device=device)
+        if num_owned > 0:
+            owned = torch.stack([params[start_idx + i] for i in range(num_owned)])
+            grads = info['grad_chunk'][:num_owned]
+            for i in range(num_owned):
+                p_owned = params[start_idx + i]
+                st = self.state[p_owned]
+                self._init_newton_state(p_owned, p_owned._newton_stats_ref)
+                apply_newton_precond_(grads[i], st["newton_inv"], st["newton_kind"])
+            self._muon_momentum_t.fill_(group["momentum"])
+            self._muon_beta2_t.fill_(group["beta2"])
+            self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
+            self._muon_wd_t.fill_(group["weight_decay"])
+            muon_step_fused(
+                grads, owned,
+                state["momentum_buffer"][:num_owned], state["second_momentum_buffer"][:num_owned],
+                self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t, self._muon_beta2_t,
+                group["ns_steps"], red_dim
+            )
+            updated[:num_owned].copy_(owned)
+        if num_owned < chunk_size:
+            updated[num_owned:].zero_()
+        stacked_params = info["stacked_grads"]
+        future = dist.all_gather_into_tensor(stacked_params, updated, async_op=True).get_future()
+        gather_list.append(dict(future=future, stacked_params=stacked_params, params=params))
+
     @torch.no_grad()
     def step(self):
+        if self.precond_flag_for_step(self.global_step):
+            self._refresh_newton_preconds()
         rank, world_size = dist.get_rank(), dist.get_world_size()
         reduce_infos = []
         for group in self.param_groups:
             if group['kind'] == 'adamw': reduce_infos.append(self._reduce_adamw(group, world_size))
-            elif group['kind'] == 'muon': reduce_infos.append(self._reduce_muon(group, world_size))
+            elif group['kind'] in ('muon', 'newton_muon'): reduce_infos.append(self._reduce_muon(group, world_size))
         gather_list = []
         for group, info in zip(self.param_groups, reduce_infos):
             if group['kind'] == 'adamw': self._compute_adamw(group, info, gather_list, rank, world_size)
             elif group['kind'] == 'muon': self._compute_muon(group, info, gather_list, rank)
+            elif group['kind'] == 'newton_muon': self._compute_newton_muon(group, info, gather_list, rank)
         for info in gather_list:
             info["future"].wait()
             if info.get("params") is not None:
                 torch._foreach_copy_(info["params"], list(info["stacked_params"][:len(info["params"])].unbind(0)))
+        self.global_step += 1
 # =============================================================================
 # Dataloader: BOS-aligned best-fit packing
 # =============================================================================
@@ -741,9 +1008,16 @@ print0(f"--- Hyperparameters ---")
 print0(f"  n_layer={DEPTH}, n_embd={N_EMBD}, n_head={N_HEAD}, head_dim={HEAD_DIM}")
 print0(f"  seq_len={MAX_SEQ_LEN}, window_pattern={WINDOW_PATTERN}")
 print0(f"  total_batch_size={TOTAL_BATCH_SIZE}, device_batch_size={args.device_batch_size}")
+print0(f"  optimizer={OPTIMIZER_KIND}")
 print0(f"  matrix_lr={MATRIX_LR}, scalar_lr={SCALAR_LR}, embedding_lr={EMBEDDING_LR}, unembedding_lr={UNEMBEDDING_LR}")
 print0(f"  weight_decay={WEIGHT_DECAY}, adam_betas={ADAM_BETAS}")
 print0(f"  warmup_ratio={WARMUP_RATIO}, warmdown_ratio={WARMDOWN_RATIO}, final_lr_frac={FINAL_LR_FRAC}")
+if OPTIMIZER_KIND == "newton_muon":
+    print0(
+        f"  newton_refresh_interval={NEWTON_REFRESH_INTERVAL}, newton_ewma={NEWTON_EWMA}, "
+        f"newton_ridge_mult={NEWTON_RIDGE_MULT}, newton_init_diag={NEWTON_INIT_DIAG}, "
+        f"newton_eps={NEWTON_EPS}, newton_block_size={NEWTON_BLOCK_SIZE}"
+    )
 print0(f"  num_epochs={args.num_epochs}, patience={args.patience}")
 print0(f"  dropout={args.dropout}")
 print0(f"-----------------------")
@@ -849,9 +1123,10 @@ while current_epoch <= args.num_epochs:
     # Training step
     synchronize()
     t0 = time.time()
+    precond_flag = optimizer.precond_flag_for_step(step)
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
-            loss = model(x, y)
+            loss = model(x, y, precond_flag=precond_flag)
         train_loss = loss.detach()
         (loss / grad_accum_steps).backward()
         x, y, epoch = next(train_loader)
@@ -878,7 +1153,7 @@ while current_epoch <= args.num_epochs:
         if "initial_wd" not in group:
             group["initial_wd"] = group.get("weight_decay", 0.0)
         group["weight_decay"] = group["initial_wd"] * wd_scale
-        if group['kind'] == 'muon':
+        if group['kind'] in ('muon', 'newton_muon'):
             group["momentum"] = get_muon_momentum(step)
     optimizer.step()
     model.zero_grad(set_to_none=True)
@@ -1003,6 +1278,7 @@ wandb_run.summary["best_val_loss"] = min_val_loss
 
 if args.save_result and master_process:
     result = {
+        "optimizer": OPTIMIZER_KIND,
         "matrix_lr": args.matrix_lr,
         "weight_decay": args.weight_decay,
         "num_epochs": args.num_epochs,
