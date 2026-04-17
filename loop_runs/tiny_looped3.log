@@ -1,0 +1,696 @@
+W0417 14:41:04.815000 1307163 torch/distributed/run.py:852] 
+W0417 14:41:04.815000 1307163 torch/distributed/run.py:852] *****************************************
+W0417 14:41:04.815000 1307163 torch/distributed/run.py:852] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W0417 14:41:04.815000 1307163 torch/distributed/run.py:852] *****************************************
+Using Flash Attention 3 (Hopper GPU detected)
+wandb: Tracking run with wandb version 0.25.1
+wandb: W&B syncing is set to `offline` in this directory. Run `wandb online` or set WANDB_MODE=online to enable cloud syncing.
+wandb: Run data is saved locally in /mnt/vast/joey/slowrun/wandb/offline-run-20260417_144136-c99t5bus
+--- Hyperparameters ---
+  n_layer=16, n_embd=1024, n_head=8, head_dim=128
+  seq_len=2048, window_pattern=SSSL
+  total_batch_size=524288, device_batch_size=32
+  block_loop_count=3
+  matrix_lr=0.032, scalar_lr=0.2, embedding_lr=0.12, unembedding_lr=0.0008
+  weight_decay=0.8, adam_betas=(0.8, 0.95)
+  warmup_ratio=0.0, warmdown_ratio=0.6, final_lr_frac=0.0
+  num_epochs=16, patience=-1
+  dropout=0.1
+-----------------------
+Vocab size: 50,257
+Padding vocab_size from 50257 to 50304
+Parameters: 316,935,720 (transformer: 205,524,480, value_embeds: 8,388,608, lm_head: 51,511,296, other: 51,511,336)
+FLOPs per token: 1.756259e+09
+Batch size: 524,288 tokens, grad accum: 1 steps
+Training for 16 epoch(s) (~3040 steps estimated)
+Eval set: 10,000,000 tokens
+Step 00000 | Val BPB: 3.517133 | Val Loss: 10.826475
+[rank6]: Traceback (most recent call last):
+[rank6]:   File "/mnt/vast/joey/slowrun/tiny/train.py", line 863, in <module>
+[rank6]:     loss = model(x, y)
+[rank6]:            ^^^^^^^^^^^
+[rank6]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 465, in __call__
+[rank6]:     return super().__call__(*args, **kwargs)
+[rank6]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank6]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank6]:     return self._call_impl(*args, **kwargs)
+[rank6]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank6]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank6]:     return forward_call(*args, **kwargs)
+[rank6]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank6]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 953, in compile_wrapper
+[rank6]:     return fn(*args, **kwargs)
+[rank6]:            ^^^^^^^^^^^^^^^^^^^
+[rank6]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank6]:     return self._call_impl(*args, **kwargs)
+[rank6]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank6]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank6]:     return forward_call(*args, **kwargs)
+[rank6]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank6]:   File "/mnt/vast/joey/slowrun/tiny/train.py", line 411, in forward
+[rank6]:     def forward(self, idx, targets=None, loss_reduction='mean'):
+[rank6]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 1181, in _fn
+[rank6]:     return fn(*args, **kwargs)
+[rank6]:            ^^^^^^^^^^^^^^^^^^^
+[rank6]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/aot_autograd.py", line 1148, in forward
+[rank6]:     return compiled_fn(full_args)
+[rank6]:            ^^^^^^^^^^^^^^^^^^^^^^
+[rank6]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 343, in runtime_wrapper
+[rank6]:     all_outs = call_func_at_runtime_with_args(
+[rank6]:                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank6]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/utils.py", line 134, in call_func_at_runtime_with_args
+[rank6]:     out = normalize_as_list(f(args))
+[rank6]:                             ^^^^^^^
+[rank6]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/utils.py", line 108, in g
+[rank6]:     return f(*args)
+[rank6]:            ^^^^^^^^
+[rank6]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/autograd/function.py", line 583, in apply
+[rank6]:     return super().apply(*args, **kwargs)  # type: ignore[misc]
+[rank6]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank6]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 2152, in forward
+[rank6]:     fw_outs = call_func_at_runtime_with_args(
+[rank6]:               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank6]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/utils.py", line 134, in call_func_at_runtime_with_args
+[rank6]:     out = normalize_as_list(f(args))
+[rank6]:                             ^^^^^^^
+[rank6]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 531, in wrapper
+[rank6]:     return compiled_fn(runtime_args)
+[rank6]:            ^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank6]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 729, in inner_fn
+[rank6]:     outs = compiled_fn(args)
+[rank6]:            ^^^^^^^^^^^^^^^^^
+[rank6]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_inductor/output_code.py", line 638, in __call__
+[rank6]:     return self.current_callable(inputs)
+[rank6]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank6]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_inductor/utils.py", line 3220, in run
+[rank6]:     out = model(new_inputs)
+[rank6]:           ^^^^^^^^^^^^^^^^^
+[rank6]:   File "/tmp/torchinductor_ubuntu/uq/cuq7dpqn6xpsslkjx3k73odyioy2h46z2nnlp6sch5nomwd3so3a.py", line 6533, in call
+[rank6]:     buf1124 = empty_strided_cuda((65536, 2816), (2816, 1), torch.bfloat16)
+[rank6]:               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank6]: torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 352.00 MiB. GPU 6 has a total capacity of 79.18 GiB of which 9.88 MiB is free. Including non-PyTorch memory, this process has 79.16 GiB memory in use. Of the allocated memory 77.60 GiB is allocated by PyTorch, and 23.02 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+[rank4]: Traceback (most recent call last):
+[rank4]:   File "/mnt/vast/joey/slowrun/tiny/train.py", line 863, in <module>
+[rank4]:     loss = model(x, y)
+[rank4]:            ^^^^^^^^^^^
+[rank4]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 465, in __call__
+[rank4]:     return super().__call__(*args, **kwargs)
+[rank4]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank4]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank4]:     return self._call_impl(*args, **kwargs)
+[rank4]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank4]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank4]:     return forward_call(*args, **kwargs)
+[rank4]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank4]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 953, in compile_wrapper
+[rank4]:     return fn(*args, **kwargs)
+[rank4]:            ^^^^^^^^^^^^^^^^^^^
+[rank4]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank4]:     return self._call_impl(*args, **kwargs)
+[rank4]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank4]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank4]:     return forward_call(*args, **kwargs)
+[rank4]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank4]:   File "/mnt/vast/joey/slowrun/tiny/train.py", line 411, in forward
+[rank4]:     def forward(self, idx, targets=None, loss_reduction='mean'):
+[rank4]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 1181, in _fn
+[rank4]:     return fn(*args, **kwargs)
+[rank4]:            ^^^^^^^^^^^^^^^^^^^
+[rank4]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/aot_autograd.py", line 1148, in forward
+[rank4]:     return compiled_fn(full_args)
+[rank4]:            ^^^^^^^^^^^^^^^^^^^^^^
+[rank4]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 343, in runtime_wrapper
+[rank4]:     all_outs = call_func_at_runtime_with_args(
+[rank4]:                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank4]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/utils.py", line 134, in call_func_at_runtime_with_args
+[rank4]:     out = normalize_as_list(f(args))
+[rank4]:                             ^^^^^^^
+[rank4]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/utils.py", line 108, in g
+[rank4]:     return f(*args)
+[rank4]:            ^^^^^^^^
+[rank4]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/autograd/function.py", line 583, in apply
+[rank4]:     return super().apply(*args, **kwargs)  # type: ignore[misc]
+[rank4]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank4]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 2152, in forward
+[rank4]:     fw_outs = call_func_at_runtime_with_args(
+[rank4]:               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank4]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/utils.py", line 134, in call_func_at_runtime_with_args
+[rank4]:     out = normalize_as_list(f(args))
+[rank4]:                             ^^^^^^^
+[rank4]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 531, in wrapper
+[rank4]:     return compiled_fn(runtime_args)
+[rank4]:            ^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank4]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 729, in inner_fn
+[rank4]:     outs = compiled_fn(args)
+[rank4]:            ^^^^^^^^^^^^^^^^^
+[rank4]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_inductor/output_code.py", line 638, in __call__
+[rank4]:     return self.current_callable(inputs)
+[rank4]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank4]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_inductor/utils.py", line 3220, in run
+[rank4]:     out = model(new_inputs)
+[rank4]:           ^^^^^^^^^^^^^^^^^
+[rank4]:   File "/tmp/torchinductor_ubuntu/ro/croknktbr4cgqkegtipomlz5e2yzpdcl6d5bhcagjbbsv5ckn3y4.py", line 6533, in call
+[rank4]:     buf1124 = empty_strided_cuda((65536, 2816), (2816, 1), torch.bfloat16)
+[rank4]:               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank4]: torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 352.00 MiB. GPU 4 has a total capacity of 79.18 GiB of which 9.88 MiB is free. Including non-PyTorch memory, this process has 79.16 GiB memory in use. Of the allocated memory 77.60 GiB is allocated by PyTorch, and 23.02 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+[rank7]: Traceback (most recent call last):
+[rank7]:   File "/mnt/vast/joey/slowrun/tiny/train.py", line 863, in <module>
+[rank7]:     loss = model(x, y)
+[rank7]:            ^^^^^^^^^^^
+[rank7]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 465, in __call__
+[rank7]:     return super().__call__(*args, **kwargs)
+[rank7]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank7]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank7]:     return self._call_impl(*args, **kwargs)
+[rank7]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank7]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank7]:     return forward_call(*args, **kwargs)
+[rank7]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank7]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 953, in compile_wrapper
+[rank7]:     return fn(*args, **kwargs)
+[rank7]:            ^^^^^^^^^^^^^^^^^^^
+[rank7]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank7]:     return self._call_impl(*args, **kwargs)
+[rank7]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank7]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank7]:     return forward_call(*args, **kwargs)
+[rank7]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank7]:   File "/mnt/vast/joey/slowrun/tiny/train.py", line 411, in forward
+[rank7]:     def forward(self, idx, targets=None, loss_reduction='mean'):
+[rank7]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 1181, in _fn
+[rank7]:     return fn(*args, **kwargs)
+[rank7]:            ^^^^^^^^^^^^^^^^^^^
+[rank7]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/aot_autograd.py", line 1148, in forward
+[rank7]:     return compiled_fn(full_args)
+[rank7]:            ^^^^^^^^^^^^^^^^^^^^^^
+[rank7]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 343, in runtime_wrapper
+[rank7]:     all_outs = call_func_at_runtime_with_args(
+[rank7]:                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank7]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/utils.py", line 134, in call_func_at_runtime_with_args
+[rank7]:     out = normalize_as_list(f(args))
+[rank7]:                             ^^^^^^^
+[rank7]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/utils.py", line 108, in g
+[rank7]:     return f(*args)
+[rank7]:            ^^^^^^^^
+[rank7]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/autograd/function.py", line 583, in apply
+[rank7]:     return super().apply(*args, **kwargs)  # type: ignore[misc]
+[rank7]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank7]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 2152, in forward
+[rank7]:     fw_outs = call_func_at_runtime_with_args(
+[rank7]:               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank7]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/utils.py", line 134, in call_func_at_runtime_with_args
+[rank7]:     out = normalize_as_list(f(args))
+[rank7]:                             ^^^^^^^
+[rank7]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 531, in wrapper
+[rank7]:     return compiled_fn(runtime_args)
+[rank7]:            ^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank7]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 729, in inner_fn
+[rank7]:     outs = compiled_fn(args)
+[rank7]:            ^^^^^^^^^^^^^^^^^
+[rank7]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_inductor/output_code.py", line 638, in __call__
+[rank7]:     return self.current_callable(inputs)
+[rank7]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank7]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_inductor/utils.py", line 3220, in run
+[rank7]:     out = model(new_inputs)
+[rank7]:           ^^^^^^^^^^^^^^^^^
+[rank7]:   File "/tmp/torchinductor_ubuntu/n3/cn3sgvnmdx3k3fro6dwru6ggisep33wvyaeuannwiaysnf2lpyxp.py", line 6533, in call
+[rank7]:     buf1124 = empty_strided_cuda((65536, 2816), (2816, 1), torch.bfloat16)
+[rank7]:               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank7]: torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 352.00 MiB. GPU 7 has a total capacity of 79.18 GiB of which 9.88 MiB is free. Including non-PyTorch memory, this process has 79.16 GiB memory in use. Of the allocated memory 77.60 GiB is allocated by PyTorch, and 23.02 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+Traceback (most recent call last):
+  File "/mnt/vast/joey/slowrun/tiny/train.py", line 863, in <module>
+    loss = model(x, y)
+           ^^^^^^^^^^^
+  File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 465, in __call__
+    return super().__call__(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 953, in compile_wrapper
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/vast/joey/slowrun/tiny/train.py", line 411, in forward
+    def forward(self, idx, targets=None, loss_reduction='mean'):
+  File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 1181, in _fn
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/aot_autograd.py", line 1148, in forward
+    return compiled_fn(full_args)
+           ^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 343, in runtime_wrapper
+    all_outs = call_func_at_runtime_with_args(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/utils.py", line 134, in call_func_at_runtime_with_args
+    out = normalize_as_list(f(args))
+                            ^^^^^^^
+  File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/utils.py", line 108, in g
+    return f(*args)
+           ^^^^^^^^
+  File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/autograd/function.py", line 583, in apply
+    return super().apply(*args, **kwargs)  # type: ignore[misc]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 2152, in forward
+    fw_outs = call_func_at_runtime_with_args(
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/utils.py", line 134, in call_func_at_runtime_with_args
+    out = normalize_as_list(f(args))
+                            ^^^^^^^
+  File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 531, in wrapper
+    return compiled_fn(runtime_args)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 729, in inner_fn
+    outs = compiled_fn(args)
+           ^^^^^^^^^^^^^^^^^
+  File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_inductor/output_code.py", line 638, in __call__
+    return self.current_callable(inputs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_inductor/utils.py", line 3220, in run
+    out = model(new_inputs)
+          ^^^^^^^^^^^^^^^^^
+  File "/tmp/torchinductor_ubuntu/4s/c4si5ipu3o75hie34veor4aotmcmtvccghggkmyxxj5yu46aaqna.py", line 6533, in call
+    buf1124 = empty_strided_cuda((65536, 2816), (2816, 1), torch.bfloat16)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 352.00 MiB. GPU 0 has a total capacity of 79.18 GiB of which 9.88 MiB is free. Including non-PyTorch memory, this process has 79.16 GiB memory in use. Of the allocated memory 77.60 GiB is allocated by PyTorch, and 23.02 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+[rank0]: Traceback (most recent call last):
+[rank0]:   File "/mnt/vast/joey/slowrun/tiny/train.py", line 863, in <module>
+[rank0]:     loss = model(x, y)
+[rank0]:            ^^^^^^^^^^^
+[rank0]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 465, in __call__
+[rank0]:     return super().__call__(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank0]:     return self._call_impl(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank0]:     return forward_call(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 953, in compile_wrapper
+[rank0]:     return fn(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank0]:     return self._call_impl(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank0]:     return forward_call(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/mnt/vast/joey/slowrun/tiny/train.py", line 411, in forward
+[rank0]:     def forward(self, idx, targets=None, loss_reduction='mean'):
+[rank0]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 1181, in _fn
+[rank0]:     return fn(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/aot_autograd.py", line 1148, in forward
+[rank0]:     return compiled_fn(full_args)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 343, in runtime_wrapper
+[rank0]:     all_outs = call_func_at_runtime_with_args(
+[rank0]:                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/utils.py", line 134, in call_func_at_runtime_with_args
+[rank0]:     out = normalize_as_list(f(args))
+[rank0]:                             ^^^^^^^
+[rank0]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/utils.py", line 108, in g
+[rank0]:     return f(*args)
+[rank0]:            ^^^^^^^^
+[rank0]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/autograd/function.py", line 583, in apply
+[rank0]:     return super().apply(*args, **kwargs)  # type: ignore[misc]
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 2152, in forward
+[rank0]:     fw_outs = call_func_at_runtime_with_args(
+[rank0]:               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/utils.py", line 134, in call_func_at_runtime_with_args
+[rank0]:     out = normalize_as_list(f(args))
+[rank0]:                             ^^^^^^^
+[rank0]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 531, in wrapper
+[rank0]:     return compiled_fn(runtime_args)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 729, in inner_fn
+[rank0]:     outs = compiled_fn(args)
+[rank0]:            ^^^^^^^^^^^^^^^^^
+[rank0]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_inductor/output_code.py", line 638, in __call__
+[rank0]:     return self.current_callable(inputs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_inductor/utils.py", line 3220, in run
+[rank0]:     out = model(new_inputs)
+[rank0]:           ^^^^^^^^^^^^^^^^^
+[rank0]:   File "/tmp/torchinductor_ubuntu/4s/c4si5ipu3o75hie34veor4aotmcmtvccghggkmyxxj5yu46aaqna.py", line 6533, in call
+[rank0]:     buf1124 = empty_strided_cuda((65536, 2816), (2816, 1), torch.bfloat16)
+[rank0]:               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]: torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 352.00 MiB. GPU 0 has a total capacity of 79.18 GiB of which 9.88 MiB is free. Including non-PyTorch memory, this process has 79.16 GiB memory in use. Of the allocated memory 77.60 GiB is allocated by PyTorch, and 23.02 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+[1;34mwandb[0m: 
+[1;34mwandb[0m: You can sync this run to the cloud by running:
+[1;34mwandb[0m: [1mwandb sync /mnt/vast/joey/slowrun/wandb/offline-run-20260417_144136-c99t5bus[0m
+[1;34mwandb[0m: Find logs at: [1;35mwandb/offline-run-20260417_144136-c99t5bus/logs[0m
+[rank1]: Traceback (most recent call last):
+[rank1]:   File "/mnt/vast/joey/slowrun/tiny/train.py", line 863, in <module>
+[rank1]:     loss = model(x, y)
+[rank1]:            ^^^^^^^^^^^
+[rank1]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 465, in __call__
+[rank1]:     return super().__call__(*args, **kwargs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank1]:     return self._call_impl(*args, **kwargs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank1]:     return forward_call(*args, **kwargs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 953, in compile_wrapper
+[rank1]:     return fn(*args, **kwargs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank1]:     return self._call_impl(*args, **kwargs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank1]:     return forward_call(*args, **kwargs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/mnt/vast/joey/slowrun/tiny/train.py", line 411, in forward
+[rank1]:     def forward(self, idx, targets=None, loss_reduction='mean'):
+[rank1]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 1181, in _fn
+[rank1]:     return fn(*args, **kwargs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/aot_autograd.py", line 1148, in forward
+[rank1]:     return compiled_fn(full_args)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 343, in runtime_wrapper
+[rank1]:     all_outs = call_func_at_runtime_with_args(
+[rank1]:                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/utils.py", line 134, in call_func_at_runtime_with_args
+[rank1]:     out = normalize_as_list(f(args))
+[rank1]:                             ^^^^^^^
+[rank1]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/utils.py", line 108, in g
+[rank1]:     return f(*args)
+[rank1]:            ^^^^^^^^
+[rank1]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/autograd/function.py", line 583, in apply
+[rank1]:     return super().apply(*args, **kwargs)  # type: ignore[misc]
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 2152, in forward
+[rank1]:     fw_outs = call_func_at_runtime_with_args(
+[rank1]:               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/utils.py", line 134, in call_func_at_runtime_with_args
+[rank1]:     out = normalize_as_list(f(args))
+[rank1]:                             ^^^^^^^
+[rank1]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 531, in wrapper
+[rank1]:     return compiled_fn(runtime_args)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 729, in inner_fn
+[rank1]:     outs = compiled_fn(args)
+[rank1]:            ^^^^^^^^^^^^^^^^^
+[rank1]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_inductor/output_code.py", line 638, in __call__
+[rank1]:     return self.current_callable(inputs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_inductor/utils.py", line 3220, in run
+[rank1]:     out = model(new_inputs)
+[rank1]:           ^^^^^^^^^^^^^^^^^
+[rank1]:   File "/tmp/torchinductor_ubuntu/ne/cnepqszefsdwapb6vpma7aw2pnuaa7f3y7hmyyanm6vmwatjjhwd.py", line 6533, in call
+[rank1]:     buf1124 = empty_strided_cuda((65536, 2816), (2816, 1), torch.bfloat16)
+[rank1]:               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]: torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 352.00 MiB. GPU 1 has a total capacity of 79.18 GiB of which 9.88 MiB is free. Including non-PyTorch memory, this process has 79.16 GiB memory in use. Of the allocated memory 77.60 GiB is allocated by PyTorch, and 23.02 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+[rank5]: Traceback (most recent call last):
+[rank5]:   File "/mnt/vast/joey/slowrun/tiny/train.py", line 863, in <module>
+[rank5]:     loss = model(x, y)
+[rank5]:            ^^^^^^^^^^^
+[rank5]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 465, in __call__
+[rank5]:     return super().__call__(*args, **kwargs)
+[rank5]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank5]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank5]:     return self._call_impl(*args, **kwargs)
+[rank5]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank5]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank5]:     return forward_call(*args, **kwargs)
+[rank5]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank5]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 953, in compile_wrapper
+[rank5]:     return fn(*args, **kwargs)
+[rank5]:            ^^^^^^^^^^^^^^^^^^^
+[rank5]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank5]:     return self._call_impl(*args, **kwargs)
+[rank5]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank5]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank5]:     return forward_call(*args, **kwargs)
+[rank5]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank5]:   File "/mnt/vast/joey/slowrun/tiny/train.py", line 411, in forward
+[rank5]:     def forward(self, idx, targets=None, loss_reduction='mean'):
+[rank5]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 1181, in _fn
+[rank5]:     return fn(*args, **kwargs)
+[rank5]:            ^^^^^^^^^^^^^^^^^^^
+[rank5]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/aot_autograd.py", line 1148, in forward
+[rank5]:     return compiled_fn(full_args)
+[rank5]:            ^^^^^^^^^^^^^^^^^^^^^^
+[rank5]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 343, in runtime_wrapper
+[rank5]:     all_outs = call_func_at_runtime_with_args(
+[rank5]:                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank5]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/utils.py", line 134, in call_func_at_runtime_with_args
+[rank5]:     out = normalize_as_list(f(args))
+[rank5]:                             ^^^^^^^
+[rank5]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/utils.py", line 108, in g
+[rank5]:     return f(*args)
+[rank5]:            ^^^^^^^^
+[rank5]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/autograd/function.py", line 583, in apply
+[rank5]:     return super().apply(*args, **kwargs)  # type: ignore[misc]
+[rank5]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank5]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 2152, in forward
+[rank5]:     fw_outs = call_func_at_runtime_with_args(
+[rank5]:               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank5]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/utils.py", line 134, in call_func_at_runtime_with_args
+[rank5]:     out = normalize_as_list(f(args))
+[rank5]:                             ^^^^^^^
+[rank5]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 531, in wrapper
+[rank5]:     return compiled_fn(runtime_args)
+[rank5]:            ^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank5]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 729, in inner_fn
+[rank5]:     outs = compiled_fn(args)
+[rank5]:            ^^^^^^^^^^^^^^^^^
+[rank5]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_inductor/output_code.py", line 638, in __call__
+[rank5]:     return self.current_callable(inputs)
+[rank5]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank5]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_inductor/utils.py", line 3220, in run
+[rank5]:     out = model(new_inputs)
+[rank5]:           ^^^^^^^^^^^^^^^^^
+[rank5]:   File "/tmp/torchinductor_ubuntu/ek/cekhhyjroukohju6qhgazvaavhuqqg7hfvw6p6x6uhyn5vuhn4lq.py", line 6533, in call
+[rank5]:     buf1124 = empty_strided_cuda((65536, 2816), (2816, 1), torch.bfloat16)
+[rank5]:               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank5]: torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 352.00 MiB. GPU 5 has a total capacity of 79.18 GiB of which 9.88 MiB is free. Including non-PyTorch memory, this process has 79.16 GiB memory in use. Of the allocated memory 77.60 GiB is allocated by PyTorch, and 23.02 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+[rank3]: Traceback (most recent call last):
+[rank3]:   File "/mnt/vast/joey/slowrun/tiny/train.py", line 863, in <module>
+[rank3]:     loss = model(x, y)
+[rank3]:            ^^^^^^^^^^^
+[rank3]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 465, in __call__
+[rank3]:     return super().__call__(*args, **kwargs)
+[rank3]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank3]:     return self._call_impl(*args, **kwargs)
+[rank3]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank3]:     return forward_call(*args, **kwargs)
+[rank3]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 953, in compile_wrapper
+[rank3]:     return fn(*args, **kwargs)
+[rank3]:            ^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank3]:     return self._call_impl(*args, **kwargs)
+[rank3]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank3]:     return forward_call(*args, **kwargs)
+[rank3]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/mnt/vast/joey/slowrun/tiny/train.py", line 411, in forward
+[rank3]:     def forward(self, idx, targets=None, loss_reduction='mean'):
+[rank3]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 1181, in _fn
+[rank3]:     return fn(*args, **kwargs)
+[rank3]:            ^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/aot_autograd.py", line 1148, in forward
+[rank3]:     return compiled_fn(full_args)
+[rank3]:            ^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 343, in runtime_wrapper
+[rank3]:     all_outs = call_func_at_runtime_with_args(
+[rank3]:                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/utils.py", line 134, in call_func_at_runtime_with_args
+[rank3]:     out = normalize_as_list(f(args))
+[rank3]:                             ^^^^^^^
+[rank3]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/utils.py", line 108, in g
+[rank3]:     return f(*args)
+[rank3]:            ^^^^^^^^
+[rank3]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/autograd/function.py", line 583, in apply
+[rank3]:     return super().apply(*args, **kwargs)  # type: ignore[misc]
+[rank3]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 2152, in forward
+[rank3]:     fw_outs = call_func_at_runtime_with_args(
+[rank3]:               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/utils.py", line 134, in call_func_at_runtime_with_args
+[rank3]:     out = normalize_as_list(f(args))
+[rank3]:                             ^^^^^^^
+[rank3]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 531, in wrapper
+[rank3]:     return compiled_fn(runtime_args)
+[rank3]:            ^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 729, in inner_fn
+[rank3]:     outs = compiled_fn(args)
+[rank3]:            ^^^^^^^^^^^^^^^^^
+[rank3]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_inductor/output_code.py", line 638, in __call__
+[rank3]:     return self.current_callable(inputs)
+[rank3]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_inductor/utils.py", line 3220, in run
+[rank3]:     out = model(new_inputs)
+[rank3]:           ^^^^^^^^^^^^^^^^^
+[rank3]:   File "/tmp/torchinductor_ubuntu/6p/c6pgojttorrfcta54tutgx4e2zzheftvkmi3imnfljch2szpx6ls.py", line 6533, in call
+[rank3]:     buf1124 = empty_strided_cuda((65536, 2816), (2816, 1), torch.bfloat16)
+[rank3]:               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]: torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 352.00 MiB. GPU 3 has a total capacity of 79.18 GiB of which 9.94 MiB is free. Including non-PyTorch memory, this process has 79.16 GiB memory in use. Of the allocated memory 77.60 GiB is allocated by PyTorch, and 23.02 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+[rank2]: Traceback (most recent call last):
+[rank2]:   File "/mnt/vast/joey/slowrun/tiny/train.py", line 863, in <module>
+[rank2]:     loss = model(x, y)
+[rank2]:            ^^^^^^^^^^^
+[rank2]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 465, in __call__
+[rank2]:     return super().__call__(*args, **kwargs)
+[rank2]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank2]:     return self._call_impl(*args, **kwargs)
+[rank2]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank2]:     return forward_call(*args, **kwargs)
+[rank2]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 953, in compile_wrapper
+[rank2]:     return fn(*args, **kwargs)
+[rank2]:            ^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank2]:     return self._call_impl(*args, **kwargs)
+[rank2]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank2]:     return forward_call(*args, **kwargs)
+[rank2]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/mnt/vast/joey/slowrun/tiny/train.py", line 411, in forward
+[rank2]:     def forward(self, idx, targets=None, loss_reduction='mean'):
+[rank2]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 1181, in _fn
+[rank2]:     return fn(*args, **kwargs)
+[rank2]:            ^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/aot_autograd.py", line 1148, in forward
+[rank2]:     return compiled_fn(full_args)
+[rank2]:            ^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 343, in runtime_wrapper
+[rank2]:     all_outs = call_func_at_runtime_with_args(
+[rank2]:                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/utils.py", line 134, in call_func_at_runtime_with_args
+[rank2]:     out = normalize_as_list(f(args))
+[rank2]:                             ^^^^^^^
+[rank2]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/utils.py", line 108, in g
+[rank2]:     return f(*args)
+[rank2]:            ^^^^^^^^
+[rank2]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/autograd/function.py", line 583, in apply
+[rank2]:     return super().apply(*args, **kwargs)  # type: ignore[misc]
+[rank2]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 2152, in forward
+[rank2]:     fw_outs = call_func_at_runtime_with_args(
+[rank2]:               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/utils.py", line 134, in call_func_at_runtime_with_args
+[rank2]:     out = normalize_as_list(f(args))
+[rank2]:                             ^^^^^^^
+[rank2]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 531, in wrapper
+[rank2]:     return compiled_fn(runtime_args)
+[rank2]:            ^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 729, in inner_fn
+[rank2]:     outs = compiled_fn(args)
+[rank2]:            ^^^^^^^^^^^^^^^^^
+[rank2]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_inductor/output_code.py", line 638, in __call__
+[rank2]:     return self.current_callable(inputs)
+[rank2]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/_inductor/utils.py", line 3220, in run
+[rank2]:     out = model(new_inputs)
+[rank2]:           ^^^^^^^^^^^^^^^^^
+[rank2]:   File "/tmp/torchinductor_ubuntu/b5/cb5tnyf6kjl2aavfxksd3a3zs37rwvl7wxwtl6j7k3hldwe4dzml.py", line 6533, in call
+[rank2]:     buf1124 = empty_strided_cuda((65536, 2816), (2816, 1), torch.bfloat16)
+[rank2]:               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]: torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 352.00 MiB. GPU 2 has a total capacity of 79.18 GiB of which 9.94 MiB is free. Including non-PyTorch memory, this process has 79.16 GiB memory in use. Of the allocated memory 77.60 GiB is allocated by PyTorch, and 23.02 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+[rank0]:[W417 14:43:37.827585271 ProcessGroupNCCL.cpp:1553] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())
+W0417 14:43:38.737000 1307163 torch/distributed/elastic/multiprocessing/api.py:1010] Sending process 1307434 closing signal SIGTERM
+W0417 14:43:38.738000 1307163 torch/distributed/elastic/multiprocessing/api.py:1010] Sending process 1307435 closing signal SIGTERM
+W0417 14:43:38.738000 1307163 torch/distributed/elastic/multiprocessing/api.py:1010] Sending process 1307436 closing signal SIGTERM
+W0417 14:43:38.739000 1307163 torch/distributed/elastic/multiprocessing/api.py:1010] Sending process 1307437 closing signal SIGTERM
+W0417 14:43:38.739000 1307163 torch/distributed/elastic/multiprocessing/api.py:1010] Sending process 1307438 closing signal SIGTERM
+W0417 14:43:38.740000 1307163 torch/distributed/elastic/multiprocessing/api.py:1010] Sending process 1307439 closing signal SIGTERM
+W0417 14:43:38.740000 1307163 torch/distributed/elastic/multiprocessing/api.py:1010] Sending process 1307441 closing signal SIGTERM
+E0417 14:43:41.571000 1307163 torch/distributed/elastic/multiprocessing/api.py:984] failed (exitcode: 1) local_rank: 6 (pid: 1307440) of binary: /mnt/vast/joey/slowrun/.venv/bin/python3
+Traceback (most recent call last):
+  File "/mnt/vast/joey/slowrun/.venv/bin/torchrun", line 10, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 362, in wrapper
+    return f(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^
+  File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/distributed/run.py", line 991, in main
+    run(args)
+  File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/distributed/run.py", line 982, in run
+    elastic_launch(
+  File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/distributed/launcher/api.py", line 170, in __call__
+    return launch_agent(self._config, self._entrypoint, list(args))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/vast/joey/slowrun/.venv/lib/python3.12/site-packages/torch/distributed/launcher/api.py", line 317, in launch_agent
+    raise ChildFailedError(
+torch.distributed.elastic.multiprocessing.errors.ChildFailedError: 
+============================================================
+tiny/train.py FAILED
+------------------------------------------------------------
+Failures:
+[1]:
+  time      : 2026-04-17_14:43:41
+  host      : SF-Compute-odin5-gpu-029.example.com
+  rank      : 0 (local_rank: 0)
+  exitcode  : -15 (pid: 1307434)
+  error_file: <N/A>
+  traceback : Signal 15 (SIGTERM) received by PID 1307434
+[2]:
+  time      : 2026-04-17_14:43:41
+  host      : SF-Compute-odin5-gpu-029.example.com
+  rank      : 1 (local_rank: 1)
+  exitcode  : -15 (pid: 1307435)
+  error_file: <N/A>
+  traceback : Signal 15 (SIGTERM) received by PID 1307435
+[3]:
+  time      : 2026-04-17_14:43:41
+  host      : SF-Compute-odin5-gpu-029.example.com
+  rank      : 2 (local_rank: 2)
+  exitcode  : -15 (pid: 1307436)
+  error_file: <N/A>
+  traceback : Signal 15 (SIGTERM) received by PID 1307436
+[4]:
+  time      : 2026-04-17_14:43:41
+  host      : SF-Compute-odin5-gpu-029.example.com
+  rank      : 3 (local_rank: 3)
+  exitcode  : -15 (pid: 1307437)
+  error_file: <N/A>
+  traceback : Signal 15 (SIGTERM) received by PID 1307437
+[5]:
+  time      : 2026-04-17_14:43:41
+  host      : SF-Compute-odin5-gpu-029.example.com
+  rank      : 4 (local_rank: 4)
+  exitcode  : -15 (pid: 1307438)
+  error_file: <N/A>
+  traceback : Signal 15 (SIGTERM) received by PID 1307438
+[6]:
+  time      : 2026-04-17_14:43:41
+  host      : SF-Compute-odin5-gpu-029.example.com
+  rank      : 5 (local_rank: 5)
+  exitcode  : -15 (pid: 1307439)
+  error_file: <N/A>
+  traceback : Signal 15 (SIGTERM) received by PID 1307439
+[7]:
+  time      : 2026-04-17_14:43:41
+  host      : SF-Compute-odin5-gpu-029.example.com
+  rank      : 7 (local_rank: 7)
+  exitcode  : -15 (pid: 1307441)
+  error_file: <N/A>
+  traceback : Signal 15 (SIGTERM) received by PID 1307441
+------------------------------------------------------------
+Root Cause (first observed failure):
+[0]:
+  time      : 2026-04-17_14:43:38
+  host      : SF-Compute-odin5-gpu-029.example.com
+  rank      : 6 (local_rank: 6)
+  exitcode  : 1 (pid: 1307440)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+============================================================

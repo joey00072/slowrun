@@ -1,0 +1,9 @@
+{
+  "matrix_lr": 0.04,
+  "weight_decay": 0.8,
+  "num_epochs": 1,
+  "block_loop_count": 3,
+  "val_loss": 4.764464127390008,
+  "best_val_loss": 4.284960696571751,
+  "wandb_url": null
+}

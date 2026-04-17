@@ -69,6 +69,7 @@ parser.add_argument("--update-ema-every", type=int, default=10)
 parser.add_argument("--ema-decay-per-epoch", type=float, default=0.15)
 parser.add_argument("--swa-last-epochs", type=int, default=4,
                     help="SWA: cosine-cycle LR in last N epochs for checkpoint diversity (0=off)")
+parser.add_argument("--block-loop-count", type=int, default=1)
 args = parser.parse_args()
 
 # Resolve output path
@@ -108,6 +109,7 @@ ADAM_BETAS = (0.8, 0.95)
 WARMUP_RATIO = 0.0
 WARMDOWN_RATIO = args.warmdown_ratio
 FINAL_LR_FRAC = 0.0
+BLOCK_LOOP_COUNT = args.block_loop_count
 
 # =============================================================================
 # Utilities
@@ -268,8 +270,14 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x, ve, cos_sin, window_size):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size)
-        x = x + self.mlp(norm(x))
+        if BLOCK_LOOP_COUNT <= 1:
+            x = x + self.attn(norm(x), ve, cos_sin, window_size)
+            x = x + self.mlp(norm(x))
+            return x
+        for idx in range(BLOCK_LOOP_COUNT):
+            scale = idx / BLOCK_LOOP_COUNT
+            x = x + self.attn(norm(x), ve, cos_sin, window_size) * scale
+            x = x + self.mlp(norm(x)) * scale
         return x
 
 
@@ -741,6 +749,7 @@ print0(f"--- Hyperparameters ---")
 print0(f"  n_layer={DEPTH}, n_embd={N_EMBD}, n_head={N_HEAD}, head_dim={HEAD_DIM}")
 print0(f"  seq_len={MAX_SEQ_LEN}, window_pattern={WINDOW_PATTERN}")
 print0(f"  total_batch_size={TOTAL_BATCH_SIZE}, device_batch_size={args.device_batch_size}")
+print0(f"  block_loop_count={BLOCK_LOOP_COUNT}")
 print0(f"  matrix_lr={MATRIX_LR}, scalar_lr={SCALAR_LR}, embedding_lr={EMBEDDING_LR}, unembedding_lr={UNEMBEDDING_LR}")
 print0(f"  weight_decay={WEIGHT_DECAY}, adam_betas={ADAM_BETAS}")
 print0(f"  warmup_ratio={WARMUP_RATIO}, warmdown_ratio={WARMDOWN_RATIO}, final_lr_frac={FINAL_LR_FRAC}")
@@ -1006,6 +1015,7 @@ if args.save_result and master_process:
         "matrix_lr": args.matrix_lr,
         "weight_decay": args.weight_decay,
         "num_epochs": args.num_epochs,
+        "block_loop_count": BLOCK_LOOP_COUNT,
         "val_loss": val_loss,
         "best_val_loss": min_val_loss,
         "wandb_url": getattr(wandb_run, "url", None),
