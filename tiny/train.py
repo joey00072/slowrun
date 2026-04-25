@@ -45,6 +45,14 @@ parser.add_argument("--matrix-lr", type=float, default=0.04)
 parser.add_argument("--embedding-lr", type=float, default=0.15)
 parser.add_argument("--unembedding-lr", type=float, default=0.001)
 parser.add_argument("--weight-decay", type=float, default=0.8)
+parser.add_argument("--outer-optimizer", choices=("muon", "adamw"), default="muon",
+                    help="Outer optimizer; use adamw for paper-faithful Nexus experiments")
+parser.add_argument("--adamw-lr", type=float, default=1e-3,
+                    help="Global AdamW LR when --outer-optimizer=adamw")
+parser.add_argument("--adamw-weight-decay", type=float, default=None,
+                    help="AdamW weight decay override when --outer-optimizer=adamw")
+parser.add_argument("--grad-clip", type=float, default=0.0,
+                    help="Global grad norm clipping before the outer optimizer step (0=off)")
 # WD follows a 3-phase schedule: hold → decay → ramp
 #   [0, wd-phase1-epoch]:          hold at --weight-decay
 #   [wd-phase1-epoch, wd-phase2-epoch]: decay to --wd-mid
@@ -69,6 +77,26 @@ parser.add_argument("--update-ema-every", type=int, default=10)
 parser.add_argument("--ema-decay-per-epoch", type=float, default=0.15)
 parser.add_argument("--swa-last-epochs", type=int, default=4,
                     help="SWA: cosine-cycle LR in last N epochs for checkpoint diversity (0=off)")
+parser.add_argument("--aux-weight", type=float, default=0.0)
+parser.add_argument("--aux-layer-idx", type=int, default=4)
+parser.add_argument("--nexus", action="store_true",
+                    help="Use Nexus inner normalized-SGD steps and feed displacement to the outer optimizer")
+parser.add_argument("--nexus-inner-steps", type=int, default=0,
+                    help="Nexus inner steps per outer step (0 = grad_accum_steps)")
+parser.add_argument("--nexus-inner-lr", type=float, default=1e-5,
+                    help="Parameter-space step size for Nexus inner normalized-SGD updates")
+parser.add_argument("--nexus-eps", type=float, default=1e-12,
+                    help="Numerical epsilon for Nexus gradient normalization")
+parser.add_argument("--nexus-scale-by-inner-lr", action="store_true",
+                    help="Use displacement / inner_lr as pseudo-gradient instead of raw displacement")
+parser.add_argument("--nexus-average-pseudo-grad", action="store_true",
+                    help="Average Nexus pseudo-gradient over inner steps after optional inner-lr scaling")
+parser.add_argument("--nexus-reuse-inner-batch", action="store_true",
+                    help="Reuse the current minibatch for all Nexus inner steps, then advance once")
+parser.add_argument("--nexus-add-baseline-grad", action="store_true",
+                    help="Add the normal loss gradient after computing the Nexus pseudo-gradient")
+parser.add_argument("--nexus-correction-weight", type=float, default=1.0,
+                    help="Multiplier for Nexus pseudo-gradient before any baseline gradient is added")
 args = parser.parse_args()
 
 # Resolve output path
@@ -108,6 +136,8 @@ ADAM_BETAS = (0.8, 0.95)
 WARMUP_RATIO = 0.0
 WARMDOWN_RATIO = args.warmdown_ratio
 FINAL_LR_FRAC = 0.0
+AUX_WEIGHT = args.aux_weight
+AUX_LAYER_INDEX = args.aux_layer_idx
 
 # =============================================================================
 # Utilities
@@ -126,6 +156,49 @@ class DummyWandb:
     def __init__(self): self.summary = {}
     def log(self, *a, **kw): pass
     def finish(self): pass
+
+def _trainable_params(model):
+    return [p for p in model.parameters() if p.requires_grad]
+
+def _average_grads(params, ddp):
+    if not ddp:
+        return
+    for p in params:
+        if p.grad is not None:
+            dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+
+def _grad_norm(params, device):
+    total = torch.zeros((), dtype=torch.float32, device=device)
+    for p in params:
+        if p.grad is not None:
+            total += p.grad.detach().float().square().sum()
+    return total.sqrt()
+
+def _nexus_inner_step(params, inner_lr, eps, device, ddp, average_grads=True):
+    if average_grads:
+        _average_grads(params, ddp)
+    norm = _grad_norm(params, device)
+    scale = inner_lr / norm.clamp_min(eps)
+    with torch.no_grad():
+        for p in params:
+            if p.grad is not None:
+                p.add_(p.grad, alpha=-scale.item())
+    return norm.detach()
+
+def _nexus_make_pseudo_grads(params, start_params, inner_lr, scale_by_inner_lr, average_steps, device):
+    disp_norm_sq = torch.zeros((), dtype=torch.float32, device=device)
+    inv_scale = (1.0 / inner_lr) if scale_by_inner_lr and inner_lr > 0 else 1.0
+    if average_steps > 1:
+        inv_scale /= average_steps
+    with torch.no_grad():
+        for p, p0 in zip(params, start_params):
+            displacement = p0 - p
+            disp_norm_sq += displacement.float().square().sum()
+            p.copy_(p0)
+            if p.grad is None:
+                p.grad = torch.empty_like(p)
+            p.grad.copy_(displacement.mul(inv_scale))
+    return disp_norm_sq.sqrt()
 
 # =============================================================================
 # Flash Attention (FA3 on Hopper, SDPA fallback elsewhere)
@@ -371,6 +444,19 @@ class GPT(nn.Module):
 
     def setup_optimizer(self):
         ddp, rank, local_rank, world_size = get_dist_info()
+        if args.outer_optimizer == "adamw":
+            decay_params = [p for p in self.parameters() if p.requires_grad and p.dim() >= 2]
+            nodecay_params = [p for p in self.parameters() if p.requires_grad and p.dim() < 2]
+            wd = WEIGHT_DECAY if args.adamw_weight_decay is None else args.adamw_weight_decay
+            param_groups = [
+                dict(kind='adamw', params=decay_params, lr=args.adamw_lr, betas=(0.9, 0.95), eps=1e-10, weight_decay=wd, compile_step=False),
+                dict(kind='adamw', params=nodecay_params, lr=args.adamw_lr, betas=(0.9, 0.95), eps=1e-10, weight_decay=0.0, compile_step=False),
+            ]
+            optimizer = DistMuonAdamW(param_groups)
+            for group in optimizer.param_groups:
+                group["initial_lr"] = group["lr"]
+            return optimizer
+
         # Separate attn_gate params (small, Adam-optimized) from matrix params (Muon)
         attn_gate_params = [block.attn.attn_gate.weight for block in self.transformer.h]
         attn_gate_ids = {id(p) for p in attn_gate_params}
@@ -400,12 +486,14 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def forward(self, idx, targets=None, loss_reduction='mean'):
+    def forward(self, idx, targets=None, loss_reduction='mean', return_aux_loss=False):
         B, T = idx.size()
         cos_sin = self.cos[:, :T], self.sin[:, :T]
         x = norm(self.transformer.wte(idx))
         x0 = x
         skip_connections = []
+        aux_residual = None
+        aux_layer_idx = min(AUX_LAYER_INDEX, self.config.n_layer - 1)
         for i, block in enumerate(self.transformer.h):
             if i >= self.encoder_layers and skip_connections:
                 skip = skip_connections.pop()
@@ -413,13 +501,21 @@ class GPT(nn.Module):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.ve_projs[str(i)](x0) if str(i) in self.ve_projs else None
             x = block(x, ve, cos_sin, self.window_sizes[i])
+            if i == aux_layer_idx:
+                aux_residual = x
             if i < self.encoder_layers:
                 skip_connections.append(x)
+        final_residual = x
         x = norm(x)
         logits = self.lm_head(x)[..., :self.config.vocab_size].float()
         logits = 15 * torch.tanh(logits / 15)  # softcap
         if targets is not None:
-            return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            main_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            if return_aux_loss:
+                assert aux_residual is not None
+                aux_loss = 1 - F.cosine_similarity(aux_residual.float(), final_residual.detach().float(), dim=-1).mean()
+                return main_loss, aux_loss
+            return main_loss
         return logits
 
 # =============================================================================
@@ -443,6 +539,14 @@ def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_
     bias1 = 1 - beta1_t ** step_t
     bias2 = 1 - beta2_t ** step_t
     p.add_(exp_avg / ((exp_avg_sq / bias2).sqrt() + eps_t), alpha=-(lr_t / bias1))
+
+def adamw_step_plain(p, grad, exp_avg, exp_avg_sq, step, lr, beta1, beta2, eps, wd):
+    p.mul_(1 - lr * wd)
+    exp_avg.lerp_(grad, 1 - beta1)
+    exp_avg_sq.lerp_(grad.square(), 1 - beta2)
+    bias1 = 1 - beta1 ** step
+    bias2 = 1 - beta2 ** step
+    p.add_(exp_avg / ((exp_avg_sq / bias2).sqrt() + eps), alpha=-(lr / bias1))
 
 @torch.compile(dynamic=False, fullgraph=True)
 def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momentum_buffer,
@@ -546,9 +650,14 @@ class DistMuonAdamW(torch.optim.Optimizer):
             self._adamw_beta2_t.fill_(group['betas'][1])
             self._adamw_eps_t.fill_(group['eps'])
             self._adamw_wd_t.fill_(group['weight_decay'])
-            adamw_step_fused(p_slice, pinfo['grad_slice'], state['exp_avg'], state['exp_avg_sq'],
-                           self._adamw_step_t, self._adamw_lr_t, self._adamw_beta1_t,
-                           self._adamw_beta2_t, self._adamw_eps_t, self._adamw_wd_t)
+            if group.get("compile_step", True):
+                adamw_step_fused(p_slice, pinfo['grad_slice'], state['exp_avg'], state['exp_avg_sq'],
+                               self._adamw_step_t, self._adamw_lr_t, self._adamw_beta1_t,
+                               self._adamw_beta2_t, self._adamw_eps_t, self._adamw_wd_t)
+            else:
+                adamw_step_plain(p_slice, pinfo['grad_slice'], state['exp_avg'], state['exp_avg_sq'],
+                                 state['step'], group['lr'], group['betas'][0], group['betas'][1],
+                                 group['eps'], group['weight_decay'])
             if not pinfo['is_small']:
                 future = dist.all_gather_into_tensor(p, p_slice, async_op=True).get_future()
                 gather_list.append(dict(future=future, params=None))
@@ -744,6 +853,9 @@ print0(f"  total_batch_size={TOTAL_BATCH_SIZE}, device_batch_size={args.device_b
 print0(f"  matrix_lr={MATRIX_LR}, scalar_lr={SCALAR_LR}, embedding_lr={EMBEDDING_LR}, unembedding_lr={UNEMBEDDING_LR}")
 print0(f"  weight_decay={WEIGHT_DECAY}, adam_betas={ADAM_BETAS}")
 print0(f"  warmup_ratio={WARMUP_RATIO}, warmdown_ratio={WARMDOWN_RATIO}, final_lr_frac={FINAL_LR_FRAC}")
+print0(f"  aux_weight={AUX_WEIGHT}")
+print0(f"  aux_layer_idx={AUX_LAYER_INDEX}")
+print0(f"  nexus={args.nexus}, nexus_inner_steps={args.nexus_inner_steps}, nexus_inner_lr={args.nexus_inner_lr}")
 print0(f"  num_epochs={args.num_epochs}, patience={args.patience}")
 print0(f"  dropout={args.dropout}")
 print0(f"-----------------------")
@@ -849,12 +961,75 @@ while current_epoch <= args.num_epochs:
     # Training step
     synchronize()
     t0 = time.time()
-    for micro_step in range(grad_accum_steps):
-        with autocast_ctx:
-            loss = model(x, y)
-        train_loss = loss.detach()
-        (loss / grad_accum_steps).backward()
-        x, y, epoch = next(train_loader)
+    nexus_grad_norm = torch.zeros((), dtype=torch.float32, device=device)
+    nexus_disp_norm = torch.zeros((), dtype=torch.float32, device=device)
+    if args.nexus:
+        params = _trainable_params(model)
+        start_params = [p.detach().clone() for p in params]
+        baseline_grads = [torch.zeros_like(p) for p in params] if args.nexus_add_baseline_grad else None
+        inner_steps = args.nexus_inner_steps if args.nexus_inner_steps > 0 else grad_accum_steps
+        inner_steps = max(1, inner_steps)
+        for micro_step in range(inner_steps):
+            with autocast_ctx:
+                if AUX_WEIGHT > 0:
+                    main_loss, aux_loss = model(x, y, return_aux_loss=True)
+                    loss = main_loss + AUX_WEIGHT * aux_loss
+                else:
+                    main_loss = model(x, y)
+                    aux_loss = torch.zeros_like(main_loss)
+                    loss = main_loss
+            train_loss = loss.detach()
+            train_main_loss = main_loss.detach()
+            train_aux_loss = aux_loss.detach()
+            loss.backward()
+            if baseline_grads is not None:
+                _average_grads(params, ddp)
+                with torch.no_grad():
+                    for buf, p in zip(baseline_grads, params):
+                        if p.grad is not None:
+                            buf.add_(p.grad, alpha=1.0 / inner_steps)
+                nexus_grad_norm += _nexus_inner_step(
+                    params, args.nexus_inner_lr, args.nexus_eps, device, ddp, average_grads=False
+                )
+            else:
+                nexus_grad_norm += _nexus_inner_step(params, args.nexus_inner_lr, args.nexus_eps, device, ddp)
+            model.zero_grad(set_to_none=True)
+            if not args.nexus_reuse_inner_batch:
+                x, y, epoch = next(train_loader)
+        nexus_grad_norm /= inner_steps
+        nexus_disp_norm = _nexus_make_pseudo_grads(
+            params, start_params, args.nexus_inner_lr, args.nexus_scale_by_inner_lr,
+            inner_steps if args.nexus_average_pseudo_grad else 1, device
+        )
+        if args.nexus_correction_weight != 1.0:
+            with torch.no_grad():
+                for p in params:
+                    if p.grad is not None:
+                        p.grad.mul_(args.nexus_correction_weight)
+        if args.nexus_add_baseline_grad:
+            with torch.no_grad():
+                for p, baseline_grad in zip(params, baseline_grads):
+                    if p.grad is None:
+                        p.grad = torch.empty_like(p)
+                    p.grad.add_(baseline_grad)
+        if args.nexus_reuse_inner_batch:
+            x, y, epoch = next(train_loader)
+        del start_params, baseline_grads
+    else:
+        for micro_step in range(grad_accum_steps):
+            with autocast_ctx:
+                if AUX_WEIGHT > 0:
+                    main_loss, aux_loss = model(x, y, return_aux_loss=True)
+                    loss = main_loss + AUX_WEIGHT * aux_loss
+                else:
+                    main_loss = model(x, y)
+                    aux_loss = torch.zeros_like(main_loss)
+                    loss = main_loss
+            train_loss = loss.detach()
+            train_main_loss = main_loss.detach()
+            train_aux_loss = aux_loss.detach()
+            (loss / grad_accum_steps).backward()
+            x, y, epoch = next(train_loader)
 
     # Update optimizer
     lrm = get_lr_multiplier(step)
@@ -880,11 +1055,15 @@ while current_epoch <= args.num_epochs:
         group["weight_decay"] = group["initial_wd"] * wd_scale
         if group['kind'] == 'muon':
             group["momentum"] = get_muon_momentum(step)
+    if args.grad_clip > 0:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
     optimizer.step()
     model.zero_grad(set_to_none=True)
     if ema_params is not None and step % args.update_ema_every == 0:
         torch._foreach_lerp_(ema_params, list(model.parameters()), 1 - param_ema_beta)
     train_loss_f = train_loss.item()
+    train_main_loss_f = train_main_loss.item()
+    train_aux_loss_f = train_aux_loss.item()
     synchronize()
     dt = time.time() - t0
 
@@ -901,8 +1080,10 @@ while current_epoch <= args.num_epochs:
         total_training_time += dt
     steps_done = step - 3
     eta_str = f" | eta: {(num_iterations - step) * total_training_time / steps_done / 60:.1f}m" if steps_done > 0 else ""
-    print0(f"step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} | dt: {dt*1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}%{eta_str}")
-    wandb_run.log({"step": step, "train/loss": debiased, "train/mfu": mfu})
+    nexus_str = f" | nexus_grad_norm: {nexus_grad_norm.item():.3e} | nexus_disp_norm: {nexus_disp_norm.item():.3e}" if args.nexus else ""
+    print0(f"step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} | main_loss: {train_main_loss_f:.6f} | aux_loss: {train_aux_loss_f:.6f}{nexus_str} | dt: {dt*1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}%{eta_str}")
+    wandb_run.log({"step": step, "train/loss": debiased, "train/main_loss": train_main_loss_f, "train/aux_loss": train_aux_loss_f, "train/mfu": mfu,
+                   "train/nexus_grad_norm": nexus_grad_norm.item(), "train/nexus_disp_norm": nexus_disp_norm.item()})
 
     # Synchronize epoch across ranks (different ranks may exhaust data at different steps)
     if ddp:
@@ -1005,7 +1186,21 @@ if args.save_result and master_process:
     result = {
         "matrix_lr": args.matrix_lr,
         "weight_decay": args.weight_decay,
+        "outer_optimizer": args.outer_optimizer,
+        "adamw_lr": args.adamw_lr,
+        "adamw_weight_decay": args.adamw_weight_decay,
+        "grad_clip": args.grad_clip,
         "num_epochs": args.num_epochs,
+        "aux_weight": args.aux_weight,
+        "aux_layer_idx": args.aux_layer_idx,
+        "nexus": args.nexus,
+        "nexus_inner_steps": args.nexus_inner_steps,
+        "nexus_inner_lr": args.nexus_inner_lr,
+        "nexus_scale_by_inner_lr": args.nexus_scale_by_inner_lr,
+        "nexus_average_pseudo_grad": args.nexus_average_pseudo_grad,
+        "nexus_reuse_inner_batch": args.nexus_reuse_inner_batch,
+        "nexus_add_baseline_grad": args.nexus_add_baseline_grad,
+        "nexus_correction_weight": args.nexus_correction_weight,
         "val_loss": val_loss,
         "best_val_loss": min_val_loss,
         "wandb_url": getattr(wandb_run, "url", None),

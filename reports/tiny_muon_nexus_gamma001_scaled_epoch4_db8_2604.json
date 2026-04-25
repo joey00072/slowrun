@@ -1,0 +1,22 @@
+{
+  "matrix_lr": 0.04,
+  "weight_decay": 0.8,
+  "outer_optimizer": "muon",
+  "adamw_lr": 0.001,
+  "adamw_weight_decay": null,
+  "grad_clip": 0.0,
+  "num_epochs": 4,
+  "aux_weight": 0.0,
+  "aux_layer_idx": 4,
+  "nexus": true,
+  "nexus_inner_steps": 0,
+  "nexus_inner_lr": 0.01,
+  "nexus_scale_by_inner_lr": true,
+  "nexus_average_pseudo_grad": false,
+  "nexus_reuse_inner_batch": false,
+  "nexus_add_baseline_grad": false,
+  "nexus_correction_weight": 1.0,
+  "val_loss": 3.936459591514186,
+  "best_val_loss": 3.84063720703125,
+  "wandb_url": null
+}

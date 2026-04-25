@@ -42,6 +42,14 @@ parser.add_argument("--run", type=str, default=None)
 parser.add_argument("--scalar-lr", type=float, default=0.1)
 parser.add_argument("--matrix-lr", type=float, default=0.04)
 parser.add_argument("--weight-decay", type=float, default=1.3)
+parser.add_argument("--outer-optimizer", choices=("muon", "adamw"), default="muon",
+                    help="Outer optimizer for trainable parameters")
+parser.add_argument("--adamw-lr", type=float, default=1e-3,
+                    help="Global AdamW LR when --outer-optimizer=adamw")
+parser.add_argument("--adamw-weight-decay", type=float, default=None,
+                    help="AdamW weight decay override when --outer-optimizer=adamw")
+parser.add_argument("--grad-clip", type=float, default=0.0,
+                    help="Clip global grad norm before outer optimizer step (0=disabled)")
 parser.add_argument("--total-batch-size", type=int, default=524288)
 parser.add_argument("--save-result", type=str, default="")
 parser.add_argument("--n_layer", type=int, default=30)
@@ -86,6 +94,38 @@ parser.add_argument("--no-iha", action="store_false", dest="iha",
                     help="Disable IHA cross-head mixing")
 parser.add_argument("--iha-lr", type=float, default=0.02,
                     help="LR for IHA mixing matrices")
+parser.add_argument("--aux-weight", type=float, default=0.0)
+parser.add_argument("--aux-layer-idx", type=int, default=15)
+parser.add_argument("--biglu-first-n", type=int, default=0,
+                    help="Use BigLU MLP in the first N layers (0=off)")
+parser.add_argument("--biglu-vocab-size", type=int, default=2048,
+                    help="Hash vocabulary size for BigLU token bigrams")
+parser.add_argument("--biglu-lr-mult", type=float, default=10.0,
+                    help="LR multiplier for BigLU bigram parameters")
+parser.add_argument("--skip-initial-val", action="store_true",
+                    help="Skip the expensive step-0 validation pass")
+parser.add_argument("--eval-start-epoch", type=int, default=1,
+                    help="First epoch index to run validation/checkpoint eval at boundaries")
+parser.add_argument("--log-code", action="store_true",
+                    help="Upload a code snapshot to wandb (disabled by default for speed)")
+parser.add_argument("--nexus", action="store_true",
+                    help="Use Nexus inner normalized-SGD steps and feed displacement to the outer optimizer")
+parser.add_argument("--nexus-inner-steps", type=int, default=0,
+                    help="Nexus inner steps per outer step (0 = grad_accum_steps)")
+parser.add_argument("--nexus-inner-lr", type=float, default=1e-5,
+                    help="Parameter-space step size for Nexus inner normalized-SGD updates")
+parser.add_argument("--nexus-eps", type=float, default=1e-12,
+                    help="Numerical epsilon for Nexus gradient normalization")
+parser.add_argument("--nexus-scale-by-inner-lr", action="store_true",
+                    help="Use displacement / inner_lr as pseudo-gradient instead of raw displacement")
+parser.add_argument("--nexus-average-pseudo-grad", action="store_true",
+                    help="Average Nexus pseudo-gradient over inner steps after optional inner-lr scaling")
+parser.add_argument("--nexus-reuse-inner-batch", action="store_true",
+                    help="Reuse the current minibatch for all Nexus inner steps, then advance once")
+parser.add_argument("--nexus-add-baseline-grad", action="store_true",
+                    help="Add the normal loss gradient after computing the Nexus pseudo-gradient")
+parser.add_argument("--nexus-correction-weight", type=float, default=1.0,
+                    help="Multiplier for Nexus pseudo-gradient before any baseline gradient is added")
 args = parser.parse_args()
 
 # Resolve output path
@@ -126,6 +166,8 @@ WARMUP_RATIO = 0.0
 WARMDOWN_RATIO = args.warmdown_ratio if args.warmdown_ratio is not None else 0.2
 FINAL_LR_FRAC = 0.0
 LOGIT_CAP = args.logit_cap
+AUX_WEIGHT = args.aux_weight
+AUX_LAYER_INDEX = args.aux_layer_idx
 
 # =============================================================================
 # Utilities
@@ -144,6 +186,49 @@ class DummyWandb:
     def __init__(self): self.summary = {}
     def log(self, *a, **kw): pass
     def finish(self): pass
+
+def _trainable_params(model):
+    return [p for p in model.parameters() if p.requires_grad]
+
+def _average_grads(params, ddp):
+    if not ddp:
+        return
+    for p in params:
+        if p.grad is not None:
+            dist.all_reduce(p.grad, op=dist.ReduceOp.AVG)
+
+def _grad_norm(params, device):
+    total = torch.zeros((), dtype=torch.float32, device=device)
+    for p in params:
+        if p.grad is not None:
+            total += p.grad.detach().float().square().sum()
+    return total.sqrt()
+
+def _nexus_inner_step(params, inner_lr, eps, device, ddp, average_grads=True):
+    if average_grads:
+        _average_grads(params, ddp)
+    norm = _grad_norm(params, device)
+    scale = inner_lr / norm.clamp_min(eps)
+    with torch.no_grad():
+        for p in params:
+            if p.grad is not None:
+                p.add_(p.grad, alpha=-scale.item())
+    return norm.detach()
+
+def _nexus_make_pseudo_grads(params, start_params, inner_lr, scale_by_inner_lr, average_steps, device):
+    disp_norm_sq = torch.zeros((), dtype=torch.float32, device=device)
+    inv_scale = (1.0 / inner_lr) if scale_by_inner_lr and inner_lr > 0 else 1.0
+    if average_steps > 1:
+        inv_scale /= average_steps
+    with torch.no_grad():
+        for p, p0 in zip(params, start_params):
+            displacement = p0 - p
+            disp_norm_sq += displacement.float().square().sum()
+            p.copy_(p0)
+            if p.grad is None:
+                p.grad = torch.empty_like(p)
+            p.grad.copy_(displacement.mul(inv_scale))
+    return disp_norm_sq.sqrt()
 
 # =============================================================================
 def load_state_dict_into_model(model, state_dict):
@@ -194,6 +279,8 @@ class GPTConfig:
     stoch_depth: float = 0.05
     use_iha: bool = False
     iha_mix_v: bool = True
+    biglu_first_n: int = 0
+    biglu_vocab_size: int = 2048
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
@@ -273,6 +360,32 @@ class CausalSelfAttention(nn.Module):
         y = y.contiguous().view(B, T, -1)
         return self.resid_dropout(self.c_proj(y))
 
+class BigramHashEmbedding(nn.Module):
+    def __init__(self, bigram_vocab_size, dim, hash_a=36313, hash_b=27191):
+        super().__init__()
+        if bigram_vocab_size < 2:
+            raise ValueError(f"biglu_vocab_size must be >= 2, got {bigram_vocab_size}")
+        self.bigram_vocab_size = bigram_vocab_size
+        self.hash_a = hash_a
+        self.hash_b = hash_b
+        self.embed = nn.Embedding(bigram_vocab_size, dim)
+        self.scale = nn.Parameter(torch.tensor(0.05, dtype=torch.float32))
+
+    def bigram_hash(self, token_ids):
+        t = token_ids.to(torch.int32)
+        mod = self.bigram_vocab_size - 1
+        out = torch.empty_like(t)
+        out[:, 0] = mod
+        out[:, 1:] = torch.bitwise_xor(self.hash_a * t[:, 1:], self.hash_b * t[:, :-1]) % mod
+        return out.long()
+
+    def forward(self, token_ids=None, bigram_ids=None):
+        if bigram_ids is None:
+            if token_ids is None:
+                raise ValueError("BigramHashEmbedding requires token_ids or bigram_ids")
+            bigram_ids = self.bigram_hash(token_ids)
+        return self.embed(bigram_ids) * self.scale.to(dtype=self.embed.weight.dtype)
+
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -285,25 +398,48 @@ class MLP(nn.Module):
     def forward(self, x):
         return self.resid_dropout(self.c_proj(F.silu(self.c_gate(x)) * self.c_fc(x)))
 
+class BigLUMLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        base_hidden = 256 * ((8 * config.n_embd // 3 + 255) // 256)
+        denom = 2 * config.n_embd + config.biglu_vocab_size
+        hidden = max(1, int((3 * config.n_embd * base_hidden) / denom))
+        self.hidden = hidden
+        self.up = nn.Linear(config.n_embd, hidden, bias=False)
+        self.down = nn.Linear(hidden, config.n_embd, bias=False)
+        self.bigram = BigramHashEmbedding(config.biglu_vocab_size, hidden)
+        self.resid_dropout = nn.Dropout(config.dropout)
+
+    def forward(self, x, token_ids=None, bigram_ids=None):
+        gate = self.bigram(token_ids=token_ids, bigram_ids=bigram_ids).to(dtype=x.dtype)
+        return self.resid_dropout(self.down(F.silu(self.up(x)) * gate))
+
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
-        self.mlp = MLP(config)
+        self.use_biglu = layer_idx < config.biglu_first_n
+        self.mlp = BigLUMLP(config) if self.use_biglu else MLP(config)
         # Stochastic depth: linear schedule from 0 at layer 0 to stoch_depth at last layer
         self.drop_prob = config.stoch_depth * (layer_idx / max(config.n_layer - 1, 1))
 
-    def forward(self, x, ve, cos_sin, window_size):
+    def forward(self, x, ve, cos_sin, window_size, token_ids=None, bigram_ids=None):
         # Stochastic depth: blend with identity when dropped (compile-friendly, no graph break)
         if self.training and self.drop_prob > 0:
             keep = (torch.rand((), device=x.device) >= self.drop_prob).to(x.dtype)
             x_in = x
             x = x + self.attn(norm(x), ve, cos_sin, window_size)
-            x = x + self.mlp(norm(x))
+            if self.use_biglu:
+                x = x + self.mlp(norm(x), token_ids=token_ids, bigram_ids=bigram_ids)
+            else:
+                x = x + self.mlp(norm(x))
             x = x_in + keep * (x - x_in)
         else:
             x = x + self.attn(norm(x), ve, cos_sin, window_size)
-            x = x + self.mlp(norm(x))
+            if self.use_biglu:
+                x = x + self.mlp(norm(x), token_ids=token_ids, bigram_ids=bigram_ids)
+            else:
+                x = x + self.mlp(norm(x))
         return x
 
 
@@ -360,9 +496,15 @@ class GPT(nn.Module):
             torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
             torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
             torch.nn.init.normal_(block.attn.c_proj.weight, mean=0.0, std=normal_std)
-            torch.nn.init.uniform_(block.mlp.c_gate.weight, -s, s)
-            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
-            torch.nn.init.normal_(block.mlp.c_proj.weight, mean=0.0, std=normal_std)
+            if getattr(block, "use_biglu", False):
+                torch.nn.init.uniform_(block.mlp.up.weight, -s, s)
+                torch.nn.init.normal_(block.mlp.down.weight, mean=0.0, std=normal_std)
+                torch.nn.init.zeros_(block.mlp.bigram.embed.weight)
+                block.mlp.bigram.scale.data.fill_(0.05)
+            else:
+                torch.nn.init.uniform_(block.mlp.c_gate.weight, -s, s)
+                torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
+                torch.nn.init.normal_(block.mlp.c_proj.weight, mean=0.0, std=normal_std)
             if block.attn.ve_gate is not None:
                 torch.nn.init.zeros_(block.attn.ve_gate.weight)
             torch.nn.init.zeros_(block.attn.attn_gate.weight)
@@ -416,6 +558,10 @@ class GPT(nn.Module):
                           + self.resid_lambdas.numel()
                           + self.x0_lambdas.numel()
                           + self.skip_weights.numel())
+        for block in self.transformer.h:
+            if getattr(block, "use_biglu", False):
+                nparams_exclude += block.mlp.bigram.embed.weight.numel()
+                nparams_exclude += block.mlp.bigram.scale.numel()
         h, q, t = self.config.n_head, self.config.n_embd // self.config.n_head, self.config.sequence_len
         # Exact causal sliding-window attention FLOPs: 12 * h * q * E[keys attended per query]
         attn_flops = sum(12 * h * q * self._avg_causal_attended_keys(w[0], t) for w in self.window_sizes)
@@ -423,6 +569,21 @@ class GPT(nn.Module):
 
     def setup_optimizer(self):
         ddp, rank, local_rank, world_size = get_dist_info()
+        if args.outer_optimizer == "adamw":
+            decay_params = [p for p in self.parameters() if p.requires_grad and p.dim() >= 2]
+            nodecay_params = [p for p in self.parameters() if p.requires_grad and p.dim() < 2]
+            wd = WEIGHT_DECAY if args.adamw_weight_decay is None else args.adamw_weight_decay
+            param_groups = [
+                dict(kind='adamw', params=decay_params, lr=args.adamw_lr, betas=(0.9, 0.95),
+                     eps=1e-10, weight_decay=wd, compile_step=False),
+                dict(kind='adamw', params=nodecay_params, lr=args.adamw_lr, betas=(0.9, 0.95),
+                     eps=1e-10, weight_decay=0.0, compile_step=False),
+            ]
+            optimizer = DistMuonAdamW(param_groups)
+            for group in optimizer.param_groups:
+                group["initial_lr"] = group["lr"]
+            return optimizer
+
         # Separate IHA mixing params (small H×H matrices) from large matrix params
         iha_params = []
         iha_param_ids = set()
@@ -440,8 +601,14 @@ class GPT(nn.Module):
                 if block.attn.iha_mix_v:
                     iha_params.append(block.attn.v_mix)
                     iha_param_ids.add(id(block.attn.v_mix))
+        biglu_params = []
+        biglu_param_ids = set()
+        for block in all_blocks:
+            if getattr(block, "use_biglu", False):
+                biglu_params.extend(list(block.mlp.bigram.parameters()))
+                biglu_param_ids.update(id(p) for p in block.mlp.bigram.parameters())
         all_h_params = list(self.transformer.h.parameters())
-        matrix_params = [p for p in all_h_params if id(p) not in iha_param_ids] + list(self.ve_projs.parameters())
+        matrix_params = [p for p in all_h_params if id(p) not in iha_param_ids and id(p) not in biglu_param_ids] + list(self.ve_projs.parameters())
         if self.mtp_weight > 0:
             mtp_params = [p for p in list(self.mtp_block.parameters()) + list(self.mtp_proj.parameters()) if id(p) not in iha_param_ids]
             matrix_params += mtp_params
@@ -464,6 +631,9 @@ class GPT(nn.Module):
         if iha_params:
             iha_lr = args.iha_lr if args.iha_lr is not None else SCALAR_LR
             param_groups.append(dict(kind='adamw', params=iha_params, lr=iha_lr, betas=ADAM_BETAS, eps=1e-10, weight_decay=0.0))
+        if biglu_params:
+            biglu_lr = EMBEDDING_LR * args.biglu_lr_mult
+            param_groups.append(dict(kind='adamw', params=biglu_params, lr=biglu_lr, betas=ADAM_BETAS, eps=1e-10, weight_decay=WEIGHT_DECAY))
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
             param_groups.append(dict(kind='muon', params=group_params, lr=MATRIX_LR,
@@ -474,7 +644,7 @@ class GPT(nn.Module):
             group["initial_lr"] = group["lr"]
         return optimizer
 
-    def _run_decoder_layers(self, x, x0, encoder_outputs, start, end, T):
+    def _run_decoder_layers(self, x, x0, encoder_outputs, token_ids, bigram_ids, start, end, T, aux_layer_idx=None, aux_residual=None):
         """Run decoder layers [start, end), with U-Net skip connections."""
         cos_sin = (self.cos[:, :T], self.sin[:, :T])
         for i in range(start, end):
@@ -484,40 +654,61 @@ class GPT(nn.Module):
                 x = x + self.skip_weights[i - self.encoder_layers] * encoder_outputs[j]
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.ve_projs[str(i)](x0) if str(i) in self.ve_projs else None
-            x = self.transformer.h[i](x, ve, cos_sin, self.window_sizes[i])
-        return x
+            x = self.transformer.h[i](x, ve, cos_sin, self.window_sizes[i], token_ids=token_ids, bigram_ids=bigram_ids)
+            if aux_layer_idx is not None and i == aux_layer_idx:
+                aux_residual = x
+        return x, aux_residual
 
     def forward(self, idx, targets=None, loss_reduction='mean'):
         B, T = idx.size()
         x = norm(self.transformer.wte(idx))
         x0 = x
         cos_sin = (self.cos[:, :T], self.sin[:, :T])
+        bigram_ids = None
+        if self.config.biglu_first_n > 0:
+            first_biglu = next((block for block in self.transformer.h if getattr(block, "use_biglu", False)), None)
+            if first_biglu is not None:
+                bigram_ids = first_biglu.mlp.bigram.bigram_hash(idx)
+        aux_residual = None
+        aux_layer_idx = min(AUX_LAYER_INDEX, self.config.n_layer - 1)
+        compute_aux = targets is not None and loss_reduction == 'mean' and AUX_WEIGHT > 0
 
         # Encoder half: run layers and collect outputs for skip connections
         encoder_outputs = []
         for i in range(self.encoder_layers):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.ve_projs[str(i)](x0) if str(i) in self.ve_projs else None
-            x = self.transformer.h[i](x, ve, cos_sin, self.window_sizes[i])
+            x = self.transformer.h[i](x, ve, cos_sin, self.window_sizes[i], token_ids=idx, bigram_ids=bigram_ids)
+            if compute_aux and i == aux_layer_idx:
+                aux_residual = x
             encoder_outputs.append(x)
 
         # Decoder half
         dupe = self._dupe_layers
         if dupe is None:
-            x = self._run_decoder_layers(x, x0, encoder_outputs,
-                                        self.encoder_layers, self.config.n_layer, T)
+            x, aux_residual = self._run_decoder_layers(
+                x, x0, encoder_outputs, idx, bigram_ids, self.encoder_layers, self.config.n_layer, T,
+                aux_layer_idx=aux_layer_idx if compute_aux else None, aux_residual=aux_residual
+            )
         else:
             # First pass: encoder boundary through end of dupe range
-            x = self._run_decoder_layers(x, x0, encoder_outputs,
-                                        self.encoder_layers, dupe[1], T)
+            x, aux_residual = self._run_decoder_layers(
+                x, x0, encoder_outputs, idx, bigram_ids, self.encoder_layers, dupe[1], T,
+                aux_layer_idx=aux_layer_idx if compute_aux else None, aux_residual=aux_residual
+            )
             # Extra replays through dupe range
             for _ in range(self._dupe_loops):
-                x = self._run_decoder_layers(x, x0, encoder_outputs,
-                                            dupe[0], dupe[1], T)
+                x, aux_residual = self._run_decoder_layers(
+                    x, x0, encoder_outputs, idx, bigram_ids, dupe[0], dupe[1], T,
+                    aux_layer_idx=aux_layer_idx if compute_aux else None, aux_residual=aux_residual
+                )
             # Remaining decoder layers
-            x = self._run_decoder_layers(x, x0, encoder_outputs,
-                                        dupe[1], self.config.n_layer, T)
+            x, aux_residual = self._run_decoder_layers(
+                x, x0, encoder_outputs, idx, bigram_ids, dupe[1], self.config.n_layer, T,
+                aux_layer_idx=aux_layer_idx if compute_aux else None, aux_residual=aux_residual
+            )
 
+        final_residual = x
         x = norm(x)
         logits = self.lm_head(x)[..., :self.config.vocab_size].float()
         logits = LOGIT_CAP * torch.tanh(logits / LOGIT_CAP) if LOGIT_CAP > 0 else logits
@@ -527,19 +718,31 @@ class GPT(nn.Module):
                                   ignore_index=-1, reduction=loss_reduction)
         if loss_reduction != 'mean':
             return lm_loss
+        metrics = {'lm_loss': lm_loss}
+        aux_loss = None
+        if compute_aux:
+            assert aux_residual is not None
+            aux_loss = 1 - F.cosine_similarity(
+                aux_residual.float(), final_residual.detach().float(), dim=-1
+            ).mean()
+            metrics['aux_loss'] = aux_loss
         if self.mtp_weight <= 0:
-            return lm_loss, {'lm_loss': lm_loss}
+            loss = lm_loss if aux_loss is None else lm_loss + AUX_WEIGHT * aux_loss
+            return loss, metrics
         mtp_emb = norm(self.transformer.wte(targets[:, :-1].clamp(min=0)))
         combined = self.mtp_proj(torch.cat([x[:, :-1], mtp_emb], dim=-1))
         mT = combined.size(1)
-        mtp_out = norm(self.mtp_block(combined, None, (self.cos[:, :mT], self.sin[:, :mT]), (-1, -1)))
+        mtp_out = norm(self.mtp_block(combined, None, (self.cos[:, :mT], self.sin[:, :mT]), (-1, -1), token_ids=targets[:, :-1].clamp(min=0), bigram_ids=None))
         mtp_logits = self.lm_head(mtp_out)[..., :self.config.vocab_size].float()
         if LOGIT_CAP > 0:
             mtp_logits = LOGIT_CAP * torch.tanh(mtp_logits / LOGIT_CAP)
         mtp_loss = F.cross_entropy(mtp_logits.view(-1, mtp_logits.size(-1)),
                                    targets[:, 1:].reshape(-1), ignore_index=-1)
         loss = lm_loss + self.mtp_weight * mtp_loss
-        return loss, {'lm_loss': lm_loss, 'mtp_loss': mtp_loss}
+        if aux_loss is not None:
+            loss = loss + AUX_WEIGHT * aux_loss
+        metrics['mtp_loss'] = mtp_loss
+        return loss, metrics
 
 # =============================================================================
 # Optimizer: MuonAdamW (Muon for matrices, AdamW for embeddings/scalars)
@@ -562,6 +765,14 @@ def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_
     bias1 = 1 - beta1_t ** step_t
     bias2 = 1 - beta2_t ** step_t
     p.add_(exp_avg / ((exp_avg_sq / bias2).sqrt() + eps_t), alpha=-(lr_t / bias1))
+
+def adamw_step_plain(p, grad, exp_avg, exp_avg_sq, step, lr, beta1, beta2, eps, wd):
+    p.mul_(1 - lr * wd)
+    exp_avg.lerp_(grad, 1 - beta1)
+    exp_avg_sq.lerp_(grad.square(), 1 - beta2)
+    bias1 = 1 - beta1 ** step
+    bias2 = 1 - beta2 ** step
+    p.add_(exp_avg / ((exp_avg_sq / bias2).sqrt() + eps), alpha=-(lr / bias1))
 
 @torch.compile(dynamic=False, fullgraph=True)
 def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momentum_buffer,
@@ -664,9 +875,14 @@ class DistMuonAdamW(torch.optim.Optimizer):
             self._adamw_beta2_t.fill_(group['betas'][1])
             self._adamw_eps_t.fill_(group['eps'])
             self._adamw_wd_t.fill_(group['weight_decay'])
-            adamw_step_fused(p_slice, pinfo['grad_slice'], state['exp_avg'], state['exp_avg_sq'],
-                           self._adamw_step_t, self._adamw_lr_t, self._adamw_beta1_t,
-                           self._adamw_beta2_t, self._adamw_eps_t, self._adamw_wd_t)
+            if group.get("compile_step", True):
+                adamw_step_fused(p_slice, pinfo['grad_slice'], state['exp_avg'], state['exp_avg_sq'],
+                               self._adamw_step_t, self._adamw_lr_t, self._adamw_beta1_t,
+                               self._adamw_beta2_t, self._adamw_eps_t, self._adamw_wd_t)
+            else:
+                adamw_step_plain(p_slice, pinfo['grad_slice'], state['exp_avg'], state['exp_avg_sq'],
+                                 state['step'], group['lr'], group['betas'][0], group['betas'][1],
+                                 group['eps'], group['weight_decay'])
             if not pinfo['is_small']:
                 future = dist.all_gather_into_tensor(p, p_slice, async_op=True).get_future()
                 gather_list.append(dict(future=future, params=None))
@@ -919,7 +1135,7 @@ _wandb_kwargs = {"project": "slowrun", "name": run_name}
 if args.wandb_group:
     _wandb_kwargs["group"] = args.wandb_group
 wandb_run = DummyWandb() if not master_process else wandb.init(**_wandb_kwargs)
-if master_process:
+if master_process and args.log_code:
     wandb_run.log_code(".")
 
 # Print hyperparameters
@@ -930,9 +1146,13 @@ print0(f"  stoch_depth={args.stoch_depth}")
 print0(f"  total_batch_size={TOTAL_BATCH_SIZE}, device_batch_size={args.device_batch_size}")
 print0(f"  matrix_lr={MATRIX_LR}, scalar_lr={SCALAR_LR}, embedding_lr={EMBEDDING_LR}, unembedding_lr={UNEMBEDDING_LR}")
 print0(f"  weight_decay={WEIGHT_DECAY}, adam_betas={ADAM_BETAS}")
+print0(f"  outer_optimizer={args.outer_optimizer}, adamw_lr={args.adamw_lr}, adamw_weight_decay={args.adamw_weight_decay}, grad_clip={args.grad_clip}")
 print0(f"  warmup_ratio={WARMUP_RATIO}, warmdown_ratio={WARMDOWN_RATIO}, final_lr_frac={FINAL_LR_FRAC}")
 print0(f"  num_epochs={args.num_epochs}, patience={args.patience}")
 print0(f"  dropout={args.dropout}")
+print0(f"  aux_weight={AUX_WEIGHT}, aux_layer_idx={AUX_LAYER_INDEX}")
+print0(f"  biglu_first_n={args.biglu_first_n}, biglu_vocab_size={args.biglu_vocab_size}, biglu_lr_mult={args.biglu_lr_mult}")
+print0(f"  nexus={args.nexus}, nexus_inner_steps={args.nexus_inner_steps}, nexus_inner_lr={args.nexus_inner_lr}")
 if args.iha:
     print0(f"  iha=True, iha_lr={args.iha_lr}")
 print0(f"-----------------------")
@@ -954,7 +1174,9 @@ token_bytes = torch.tensor(token_bytes_list, dtype=torch.int32, device=device)
 # Build model
 config = GPTConfig(vocab_size=vocab_size, dropout=args.dropout,
                    stoch_depth=args.stoch_depth,
-                   use_iha=args.iha, iha_mix_v=args.iha)
+                   use_iha=args.iha, iha_mix_v=args.iha,
+                   biglu_first_n=args.biglu_first_n,
+                   biglu_vocab_size=args.biglu_vocab_size)
 with torch.device("meta"):
     model = GPT(config)
 model.to_empty(device=device)
@@ -1013,6 +1235,7 @@ _swa_start_step = (num_iterations - args.swa_last_epochs * steps_per_epoch) if a
 step = 0
 min_val_bpb = float("inf")
 min_val_loss = float("inf")
+val_loss = float("inf")
 epochs_without_improvement = 0
 smooth_train_loss = 0
 total_training_time = 0
@@ -1032,14 +1255,17 @@ if args.eval_logit_avg:
     print0("--eval-logit-avg set: skipping training, loading checkpoints from disk.")
 else:
     # Initial val evaluation
-    model.eval()
-    val_loader = build_val_loader()
-    with autocast_ctx:
-        val_bpb, val_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
-    print0(f"Step {step:05d} | Val BPB: {val_bpb:.6f} | Val Loss: {val_loss:.6f}")
-    wandb_run.log({"step": step, "val/bpb": val_bpb, "val/loss": val_loss})
-    min_val_bpb = val_bpb
-    min_val_loss = val_loss
+    if args.skip_initial_val:
+        print0("Skipping initial validation (--skip-initial-val)")
+    else:
+        model.eval()
+        val_loader = build_val_loader()
+        with autocast_ctx:
+            val_bpb, val_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
+        print0(f"Step {step:05d} | Val BPB: {val_bpb:.6f} | Val Loss: {val_loss:.6f}")
+        wandb_run.log({"step": step, "val/bpb": val_bpb, "val/loss": val_loss})
+        min_val_bpb = val_bpb
+        min_val_loss = val_loss
     model.train()
 
 while not args.eval_logit_avg and current_epoch <= args.num_epochs:
@@ -1055,12 +1281,59 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
     # Training step
     synchronize()
     t0 = time.time()
-    for micro_step in range(grad_accum_steps):
-        with autocast_ctx:
-            loss, metrics = model(x, y)
-        train_loss = loss.detach()
-        (loss / grad_accum_steps).backward()
-        x, y, epoch = next(train_loader)
+    nexus_grad_norm = torch.zeros((), dtype=torch.float32, device=device)
+    nexus_disp_norm = torch.zeros((), dtype=torch.float32, device=device)
+    if args.nexus:
+        params = _trainable_params(model)
+        start_params = [p.detach().clone() for p in params]
+        baseline_grads = [torch.zeros_like(p) for p in params] if args.nexus_add_baseline_grad else None
+        inner_steps = args.nexus_inner_steps if args.nexus_inner_steps > 0 else grad_accum_steps
+        inner_steps = max(1, inner_steps)
+        for micro_step in range(inner_steps):
+            with autocast_ctx:
+                loss, metrics = model(x, y)
+            train_loss = loss.detach()
+            loss.backward()
+            if baseline_grads is not None:
+                _average_grads(params, ddp)
+                with torch.no_grad():
+                    for buf, p in zip(baseline_grads, params):
+                        if p.grad is not None:
+                            buf.add_(p.grad, alpha=1.0 / inner_steps)
+                nexus_grad_norm += _nexus_inner_step(
+                    params, args.nexus_inner_lr, args.nexus_eps, device, ddp, average_grads=False
+                )
+            else:
+                nexus_grad_norm += _nexus_inner_step(params, args.nexus_inner_lr, args.nexus_eps, device, ddp)
+            model.zero_grad(set_to_none=True)
+            if not args.nexus_reuse_inner_batch:
+                x, y, epoch = next(train_loader)
+        nexus_grad_norm /= inner_steps
+        nexus_disp_norm = _nexus_make_pseudo_grads(
+            params, start_params, args.nexus_inner_lr, args.nexus_scale_by_inner_lr,
+            inner_steps if args.nexus_average_pseudo_grad else 1, device
+        )
+        if args.nexus_correction_weight != 1.0:
+            with torch.no_grad():
+                for p in params:
+                    if p.grad is not None:
+                        p.grad.mul_(args.nexus_correction_weight)
+        if args.nexus_add_baseline_grad:
+            with torch.no_grad():
+                for p, baseline_grad in zip(params, baseline_grads):
+                    if p.grad is None:
+                        p.grad = torch.empty_like(p)
+                    p.grad.add_(baseline_grad)
+        if args.nexus_reuse_inner_batch:
+            x, y, epoch = next(train_loader)
+        del start_params, baseline_grads
+    else:
+        for micro_step in range(grad_accum_steps):
+            with autocast_ctx:
+                loss, metrics = model(x, y)
+            train_loss = loss.detach()
+            (loss / grad_accum_steps).backward()
+            x, y, epoch = next(train_loader)
 
     # Update optimizer
     lrm = get_lr_multiplier(step)
@@ -1073,6 +1346,8 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
         group["lr"] = group["initial_lr"] * lrm
         if group['kind'] == 'muon':
             group["momentum"] = get_muon_momentum(step)
+    if args.grad_clip > 0:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
     optimizer.step()
     model.zero_grad(set_to_none=True)
     train_loss_f = train_loss.item()
@@ -1093,9 +1368,16 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
         timed_steps += 1
     eta_str = f" | eta: {(num_iterations - step) * total_training_time / timed_steps / 60:.1f}m" if timed_steps > 0 else ""
     dupe_str = " [DUPE]" if dupe_active else ""
-    print0(f"step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f} | dt: {dt*1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}%{dupe_str}{eta_str}")
+    metric_str = ""
+    if metrics:
+        metric_str = " | " + " | ".join(f"{k}: {v.item():.6f}" for k, v in metrics.items())
+    if args.nexus:
+        metric_str += f" | nexus_grad_norm: {nexus_grad_norm.item():.3e} | nexus_disp_norm: {nexus_disp_norm.item():.3e}"
+    print0(f"step {step:05d} ({pct:.2f}%) | loss: {debiased:.6f}{metric_str} | dt: {dt*1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f}%{dupe_str}{eta_str}")
     wandb_run.log({"step": step, "train/loss": debiased, "train/mfu": mfu,
-                   **{f"train/{k}": v.item() for k, v in metrics.items()}})
+                   **{f"train/{k}": v.item() for k, v in metrics.items()},
+                   "train/nexus_grad_norm": nexus_grad_norm.item(),
+                   "train/nexus_disp_norm": nexus_disp_norm.item()})
 
     # Synchronize epoch across ranks (different ranks may exhaust data at different steps)
     if ddp:
@@ -1105,36 +1387,40 @@ while not args.eval_logit_avg and current_epoch <= args.num_epochs:
 
     # Epoch boundary: evaluate when the dataloader advances to a new epoch
     if epoch != current_epoch:
-        model.eval()
-        val_loader = build_val_loader()
-        with autocast_ctx:
-            val_bpb, val_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
-        print0(f"Step {step:05d} | Epoch {current_epoch} | Val BPB: {val_bpb:.6f} | Val Loss: {val_loss:.6f}")
-        wandb_run.log({"step": step, "epoch": current_epoch, "val/bpb": val_bpb, "val/loss": val_loss})
-        # Early stopping
-        if val_bpb < min_val_bpb:
-            min_val_bpb = val_bpb
-            min_val_loss = val_loss
-            epochs_without_improvement = 0
+        should_eval = current_epoch >= args.eval_start_epoch
+        if should_eval:
+            model.eval()
+            val_loader = build_val_loader()
+            with autocast_ctx:
+                val_bpb, val_loss = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
+            print0(f"Step {step:05d} | Epoch {current_epoch} | Val BPB: {val_bpb:.6f} | Val Loss: {val_loss:.6f}")
+            wandb_run.log({"step": step, "epoch": current_epoch, "val/bpb": val_bpb, "val/loss": val_loss})
+            # Early stopping
+            if val_bpb < min_val_bpb:
+                min_val_bpb = val_bpb
+                min_val_loss = val_loss
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
+                if args.patience >= 0 and epochs_without_improvement >= args.patience:
+                    print0(f"Early stopping: no improvement for {args.patience} epoch(s)")
+                    break
+            # Save checkpoint to disk for logit averaging only when it may actually be used.
+            logit_avg_first_epoch = max(args.eval_start_epoch, args.num_epochs - logit_avg_count + 1)
+            if logit_avg_count > 0 and current_epoch >= logit_avg_first_epoch:
+                ckpt_path = os.path.join(args.logit_avg_dir, f"epoch_{current_epoch:03d}.pt")
+                if master_process:
+                    ckpt = {name: p.data.float().cpu() for name, p in orig_model.named_parameters()}
+                    torch.save(ckpt, ckpt_path)
+                    del ckpt
+                late_checkpoint_paths.append(ckpt_path)
+                if len(late_checkpoint_paths) > logit_avg_count:
+                    old = late_checkpoint_paths.pop(0)
+                    if master_process and os.path.exists(old):
+                        os.remove(old)
+                print0(f"  Saved checkpoint {ckpt_path} ({len(late_checkpoint_paths)}/{logit_avg_count})")
         else:
-            epochs_without_improvement += 1
-            if args.patience >= 0 and epochs_without_improvement >= args.patience:
-                print0(f"Early stopping: no improvement for {args.patience} epoch(s)")
-                break
-        # Save checkpoint to disk for logit averaging
-        if logit_avg_count > 0:
-            ckpt_path = os.path.join(args.logit_avg_dir, f"epoch_{current_epoch:03d}.pt")
-            if master_process:
-                ckpt = {name: p.data.float().cpu() for name, p in orig_model.named_parameters()}
-                torch.save(ckpt, ckpt_path)
-                del ckpt
-            late_checkpoint_paths.append(ckpt_path)
-            if len(late_checkpoint_paths) > logit_avg_count:
-                old = late_checkpoint_paths.pop(0)
-                if master_process and os.path.exists(old):
-                    os.remove(old)
-            print0(f"  Saved checkpoint {ckpt_path} ({len(late_checkpoint_paths)}/{logit_avg_count})")
-
+            print0(f"Step {step:05d} | Epoch {current_epoch} | Skipping validation (< eval-start-epoch {args.eval_start_epoch})")
         model.train()
         # Update num_iterations estimate now that we know real steps per epoch
         # steps_per_epoch = step // current_epoch
@@ -1205,7 +1491,23 @@ if args.save_result and master_process:
     result = {
         "matrix_lr": args.matrix_lr,
         "weight_decay": args.weight_decay,
+        "outer_optimizer": args.outer_optimizer,
+        "adamw_lr": args.adamw_lr,
+        "adamw_weight_decay": args.adamw_weight_decay,
+        "grad_clip": args.grad_clip,
         "num_epochs": args.num_epochs,
+        "aux_weight": args.aux_weight,
+        "aux_layer_idx": args.aux_layer_idx,
+        "biglu_first_n": args.biglu_first_n,
+        "biglu_vocab_size": args.biglu_vocab_size,
+        "nexus": args.nexus,
+        "nexus_inner_steps": args.nexus_inner_steps,
+        "nexus_inner_lr": args.nexus_inner_lr,
+        "nexus_scale_by_inner_lr": args.nexus_scale_by_inner_lr,
+        "nexus_average_pseudo_grad": args.nexus_average_pseudo_grad,
+        "nexus_reuse_inner_batch": args.nexus_reuse_inner_batch,
+        "nexus_add_baseline_grad": args.nexus_add_baseline_grad,
+        "nexus_correction_weight": args.nexus_correction_weight,
         "val_loss": val_loss,
         "best_val_loss": min_val_loss,
         "wandb_url": getattr(wandb_run, "url", None),
