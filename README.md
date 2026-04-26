@@ -54,6 +54,7 @@ The limited-compute track caps runs at a single 8xH100 node for at most 1 hour.
 17 | 3.214 | Add [Interleaved Head Attention (IHA)](https://arxiv.org/abs/2602.21371) | 04/13/26 | 58.9 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/bd719090f61d88659bc21e9d7b2e69f781231e75/train.py) | [@ms337](https://x.com/madhavsinghal_)
 18 | 3.211 | Add [MuonEq-R](https://arxiv.org/abs/2603.28254) | 04/17/26 | 59.4 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/a2ed9f4530d2dbd80b8cc0b8775659b196053277/train.py) | [@clarkkev](https://github.com/clarkkev)
 19 | 3.204 | Add document-level shuffling | 04/24/26 | 59.0 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/a4732774888d535f681295de4ef1c66a57a3cc60/train.py) | [@samacqua](https://x.com/Sam_Acqua)
+20 | 3.195 | Add weight decay schedule, adjust learning rate schedule | 04/26/26 | 59.0 mins | [Script](https://github.com/qlabs-eng/slowrun/blob/571b296eda47bdd291937d017ea49f23317088cb/train.py) | [@shmublu](https://x.com/ShmuelBerman)
 
 
 ### Tiny Track (15 minutes)
