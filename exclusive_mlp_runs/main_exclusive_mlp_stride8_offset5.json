@@ -1,0 +1,12 @@
+{
+  "matrix_lr": 0.04,
+  "weight_decay": 1.3,
+  "num_epochs": 11,
+  "exclusive_mlp": true,
+  "exclusive_mlp_eps": 1e-06,
+  "exclusive_mlp_stride": 8,
+  "exclusive_mlp_offset": 5,
+  "val_loss": 3.238688820286801,
+  "best_val_loss": 3.1977059076491154,
+  "wandb_url": null
+}

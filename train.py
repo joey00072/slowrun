@@ -84,6 +84,16 @@ parser.add_argument("--stoch-depth", type=float, default=0.05,
                     help="Stochastic depth max drop rate (linear schedule, 0=off)")
 parser.add_argument("--mtp-weight", type=float, default=0.3,
                     help="Multi-token prediction weight (0=off)")
+parser.add_argument("--exclusive-mlp", action="store_true",
+                    help="Project each MLP update orthogonal to the residual stream before adding it")
+parser.add_argument("--exclusive-mlp-eps", type=float, default=1e-6,
+                    help="Denominator clamp for exclusive MLP projection")
+parser.add_argument("--exclusive-mlp-stride", type=int, default=1,
+                    help="Apply exclusive MLP every N layers when --exclusive-mlp is set")
+parser.add_argument("--exclusive-mlp-offset", type=int, default=0,
+                    help="First layer offset for --exclusive-mlp-stride")
+parser.add_argument("--exclusive-mlp-skip-layers", type=str, default="",
+                    help="Comma-separated layer ids or ranges to skip, e.g. '15-20,24'")
 parser.add_argument("--iha", action="store_true", default=True,
                     help="Enable Interleaved Head Attention (cross-head Q/K/V mixing)")
 parser.add_argument("--no-iha", action="store_false", dest="iha",
@@ -93,6 +103,32 @@ parser.add_argument("--iha-lr", type=float, default=0.02,
 parser.add_argument("--no-doc-shuffle", action="store_true",
                     help="Disable per-epoch document reshuffling (still shuffles batch order)")
 args = parser.parse_args()
+if args.exclusive_mlp_stride < 1:
+    parser.error("--exclusive-mlp-stride must be >= 1")
+if args.exclusive_mlp_offset < 0:
+    parser.error("--exclusive-mlp-offset must be >= 0")
+
+def parse_layer_set(spec):
+    layers = set()
+    if not spec:
+        return layers
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start_s, end_s = part.split("-", 1)
+            start, end = int(start_s), int(end_s)
+            if end < start:
+                parser.error(f"Invalid layer range '{part}'")
+            layers.update(range(start, end))
+        else:
+            layers.add(int(part))
+    if any(layer < 0 for layer in layers):
+        parser.error("--exclusive-mlp-skip-layers must be non-negative")
+    return layers
+
+exclusive_mlp_skip_layers = parse_layer_set(args.exclusive_mlp_skip_layers)
 
 # Resolve output path
 if args.output_json and not args.save_result:
@@ -227,6 +263,11 @@ class GPTConfig:
     stoch_depth: float = 0.05
     use_iha: bool = False
     iha_mix_v: bool = True
+    exclusive_mlp: bool = False
+    exclusive_mlp_eps: float = 1e-6
+    exclusive_mlp_stride: int = 1
+    exclusive_mlp_offset: int = 0
+    exclusive_mlp_skip_layers: tuple[int, ...] = ()
 
 def norm(x):
     return F.rms_norm(x, (x.size(-1),))
@@ -323,8 +364,23 @@ class Block(nn.Module):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
+        self.exclusive_mlp = (
+            config.exclusive_mlp
+            and layer_idx not in config.exclusive_mlp_skip_layers
+            and layer_idx >= config.exclusive_mlp_offset
+            and (layer_idx - config.exclusive_mlp_offset) % config.exclusive_mlp_stride == 0
+        )
+        self.exclusive_mlp_eps = config.exclusive_mlp_eps
         # Stochastic depth: linear schedule from 0 at layer 0 to stoch_depth at last layer
         self.drop_prob = config.stoch_depth * (layer_idx / max(config.n_layer - 1, 1))
+
+    def apply_mlp(self, x):
+        m = self.mlp(norm(x))
+        if self.exclusive_mlp:
+            dot = (m * x).sum(dim=-1, keepdim=True)
+            x_norm2 = (x * x).sum(dim=-1, keepdim=True)
+            m = m - dot / x_norm2.clamp_min(self.exclusive_mlp_eps) * x
+        return x + m
 
     def forward(self, x, ve, cos_sin, window_size):
         # Stochastic depth: blend with identity when dropped (compile-friendly, no graph break)
@@ -332,11 +388,11 @@ class Block(nn.Module):
             keep = (torch.rand((), device=x.device) >= self.drop_prob).to(x.dtype)
             x_in = x
             x = x + self.attn(norm(x), ve, cos_sin, window_size)
-            x = x + self.mlp(norm(x))
+            x = self.apply_mlp(x)
             x = x_in + keep * (x - x_in)
         else:
             x = x + self.attn(norm(x), ve, cos_sin, window_size)
-            x = x + self.mlp(norm(x))
+            x = self.apply_mlp(x)
         return x
 
 
@@ -1013,6 +1069,7 @@ print0(f"  weight_decay={WEIGHT_DECAY}, adam_betas={ADAM_BETAS}")
 print0(f"  warmup_ratio={WARMUP_RATIO}, warmdown_ratio={WARMDOWN_RATIO}, final_lr_frac={FINAL_LR_FRAC}")
 print0(f"  num_epochs={args.num_epochs}, patience={args.patience}")
 print0(f"  dropout={args.dropout}, doc_shuffle={not args.no_doc_shuffle}")
+print0(f"  exclusive_mlp={args.exclusive_mlp}, exclusive_mlp_eps={args.exclusive_mlp_eps}, exclusive_mlp_stride={args.exclusive_mlp_stride}, exclusive_mlp_offset={args.exclusive_mlp_offset}, exclusive_mlp_skip_layers={sorted(exclusive_mlp_skip_layers)}")
 print0(f"  run={run_name}")
 print0(f"  run_dir={run_dir}")
 if args.iha:
@@ -1036,7 +1093,12 @@ token_bytes = torch.tensor(token_bytes_list, dtype=torch.int32, device=device)
 # Build model
 config = GPTConfig(vocab_size=vocab_size, dropout=args.dropout,
                    stoch_depth=args.stoch_depth,
-                   use_iha=args.iha, iha_mix_v=args.iha)
+                   use_iha=args.iha, iha_mix_v=args.iha,
+                   exclusive_mlp=args.exclusive_mlp,
+                   exclusive_mlp_eps=args.exclusive_mlp_eps,
+                   exclusive_mlp_stride=args.exclusive_mlp_stride,
+                   exclusive_mlp_offset=args.exclusive_mlp_offset,
+                   exclusive_mlp_skip_layers=tuple(exclusive_mlp_skip_layers))
 with torch.device("meta"):
     model = GPT(config)
 model.to_empty(device=device)
@@ -1310,6 +1372,11 @@ if master_process:
         "matrix_lr": args.matrix_lr,
         "weight_decay": args.weight_decay,
         "num_epochs": args.num_epochs,
+        "exclusive_mlp": args.exclusive_mlp,
+        "exclusive_mlp_eps": args.exclusive_mlp_eps,
+        "exclusive_mlp_stride": args.exclusive_mlp_stride,
+        "exclusive_mlp_offset": args.exclusive_mlp_offset,
+        "exclusive_mlp_skip_layers": sorted(exclusive_mlp_skip_layers),
         "val_loss": val_loss,
         "best_val_loss": min_val_loss,
         "wandb_url": getattr(wandb_run, "url", None),
